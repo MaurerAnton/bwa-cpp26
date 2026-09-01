@@ -153,7 +153,8 @@ void Index::build_impl(const char* fasta_path, const Config& cfg, memory::Arena&
     io::SeqRecord rec;
     size_t total_len = 0;
 
-    while (reader.read(rec)) {
+    auto read_result = reader.read(rec);
+    while (read_result && *read_result) {
         if (rec.is_fasta() && !rec.seq.empty()) {
             RefSequence ref;
             ref.name = std::move(rec.name);
@@ -168,6 +169,8 @@ void Index::build_impl(const char* fasta_path, const Config& cfg, memory::Arena&
             refs_.push_back(std::move(ref));
             total_len += rec.seq.size();
         }
+        rec.clear();
+        read_result = reader.read(rec);
     }
 
     // Build metadata string for saving
@@ -190,43 +193,37 @@ void Index::build_impl(const char* fasta_path, const Config& cfg, memory::Arena&
 
 void Index::save_impl(const char* prefix) const {
     // Save metadata
-    core::PmrString meta_path;
-    meta_path.kputs(prefix);
-    meta_path.kputs(".meta");
-    std::ofstream meta_out(meta_path.data(), std::ios::binary);
-    meta_out.write(meta_.data(), meta_.size());
+    std::string meta_path = std::string(prefix) + ".meta";
+    std::ofstream meta_out(meta_path, std::ios::binary);
+    if (meta_) {
+        meta_out.write(meta_.data(), static_cast<std::streamsize>(meta_.size()));
+    }
     meta_out.close();
 
     // Save FM-index (simplified - just BWT for now)
-    core::PmrString bwt_path;
-    bwt_path.kputs(prefix);
-    bwt_path.kputs(".bwt");
-    std::ofstream bwt_out(bwt_path.data(), std::ios::binary);
+    std::string bwt_path = std::string(prefix) + ".bwt";
+    std::ofstream bwt_out(bwt_path, std::ios::binary);
     for (const auto& fm : fm_index_) {
         bwt_out.write(reinterpret_cast<const char*>(fm.bwt().words().data()),
-                      fm.bwt().words().size() * sizeof(uint64_t));
+                      static_cast<std::streamsize>(fm.bwt().words().size() * sizeof(uint64_t)));
     }
     bwt_out.close();
 
     // Save SA samples
-    core::PmrString sa_path;
-    sa_path.kputs(prefix);
-    sa_path.kputs(".sa");
-    std::ofstream sa_out(sa_path.data(), std::ios::binary);
+    std::string sa_path = std::string(prefix) + ".sa";
+    std::ofstream sa_out(sa_path, std::ios::binary);
     for (const auto& fm : fm_index_) {
         sa_out.write(reinterpret_cast<const char*>(fm.sa_samples().data()),
-                     fm.sa_samples().size() * sizeof(uint32_t));
+                     static_cast<std::streamsize>(fm.sa_samples().size() * sizeof(uint32_t)));
     }
     sa_out.close();
 
     // Save occ
-    core::PmrString occ_path;
-    occ_path.kputs(prefix);
-    occ_path.kputs(".occ");
-    std::ofstream occ_out(occ_path.data(), std::ios::binary);
+    std::string occ_path = std::string(prefix) + ".occ";
+    std::ofstream occ_out(occ_path, std::ios::binary);
     for (const auto& fm : fm_index_) {
         occ_out.write(reinterpret_cast<const char*>(fm.occ_table().data()),
-                      fm.occ_table().size() * sizeof(uint32_t));
+                      static_cast<std::streamsize>(fm.occ_table().size() * sizeof(uint32_t)));
     }
     occ_out.close();
 }

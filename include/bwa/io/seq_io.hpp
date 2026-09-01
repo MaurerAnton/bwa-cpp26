@@ -110,7 +110,10 @@ public:
         char ch;
         while (true) {
             auto result = read(&ch, 1);
-            if (!result) return std::unexpected(result.error());
+            if (!result) {
+                if (buf.empty()) return std::unexpected(result.error());
+                return buf.size();
+            }
             if (*result == 0) {
                 return buf.empty() ? std::unexpected(IoError::Eof) : std::expected<size_t, IoError>(buf.size());
             }
@@ -238,13 +241,8 @@ public:
             last_error_ = IoError::FileNotFound;
             return false;
         }
-        // Peek first char to detect format
-        char first;
-        if (gzread(gz_.get(), &first, 1) != 1) {
-            last_error_ = IoError::InvalidFormat;
-            return false;
-        }
-        gzseek(gz_.get(), 0, SEEK_SET);
+        // Rewind to start (gzseek with SEEK_SET may not work for plain files)
+        gzrewind(gz_.get());
         last_line_read_ = false;
         return true;
     }
@@ -258,15 +256,19 @@ public:
     [[nodiscard]] std::expected<bool, IoError> read(SeqRecord& record) noexcept {
         record.clear();
         last_error_ = IoError::None;
+        last_line_read_ = false;
 
         // Read header line (@ or >)
         while (true) {
             auto result = gz_.readline(line_buf_);
             if (!result) {
-                last_error_ = result.error();
-                return std::unexpected(last_error_);
+                if (line_buf_.empty()) {
+                    last_error_ = result.error();
+                    return std::unexpected(last_error_);
+                }
+                break;
             }
-            if (*result == 0) {
+            if (*result == 0 && line_buf_.empty()) {
                 last_error_ = IoError::Eof;
                 return false; // EOF
             }
@@ -286,20 +288,34 @@ public:
             record.comment.assign(header.substr(space_pos + 1));
         }
 
+        // Check if FASTA or FASTQ based on header character
+        bool is_fasta_header = (line_buf_.size() > 0 && line_buf_[0] == '>');
+
         // Read sequence lines
         seq_buf_.clear();
         while (true) {
             auto result = gz_.readline(line_buf_);
             if (!result) {
+                if (!seq_buf_.empty()) break; // Got sequence, done
                 last_error_ = result.error();
                 return std::unexpected(last_error_);
             }
-            if (*result == 0) {
-                last_error_ = IoError::TruncatedRecord;
-                return std::unexpected(last_error_); // Unexpected EOF
+            if (*result == 0 && line_buf_.empty()) {
+                // EOF
+                break;
             }
-            if (!line_buf_.empty() && (line_buf_[0] == '+' || line_buf_[0] == '>')) {
-                // Next record header or quality header
+            if (!line_buf_.empty() && line_buf_[0] == '+') {
+                // FASTQ quality header
+                last_line_read_ = true;
+                break;
+            }
+            if (!line_buf_.empty() && line_buf_[0] == '>') {
+                // Next FASTA record header
+                last_line_read_ = true;
+                break;
+            }
+            if (!line_buf_.empty() && line_buf_[0] == '@') {
+                // Next FASTQ record header
                 last_line_read_ = true;
                 break;
             }
@@ -307,11 +323,9 @@ public:
         }
         record.seq = std::move(seq_buf_);
 
-        // Check if FASTA (next record started with >)
-        if (last_line_read_ && !line_buf_.empty() && line_buf_[0] == '>') {
-            // This is actually the next FASTA record - put it back by seeking
-            // For simplicity, we'll store it for next read
-            record.qual.clear(); // FASTA
+        // FASTA: no quality, return immediately
+        if (is_fasta_header) {
+            record.qual.clear();
             return true;
         }
 
@@ -320,16 +334,17 @@ public:
         qual_buf_.clear();
         size_t qual_needed = record.seq.size();
         while (qual_buf_.size() < qual_needed) {
-            auto result = gz_.readline(line_buf_);
+            auto result = gz_.readline(qual_buf_);
             if (!result) {
+                if (qual_buf_.size() >= qual_needed) break;
                 last_error_ = result.error();
                 return std::unexpected(last_error_);
             }
-            if (*result == 0) {
+            if (*result == 0 && qual_buf_.empty()) {
+                if (qual_buf_.size() >= qual_needed) break;
                 last_error_ = IoError::TruncatedRecord;
                 return std::unexpected(last_error_);
             }
-            qual_buf_.append(line_buf_.view());
         }
         // Trim to sequence length
         if (qual_buf_.size() > qual_needed) {
@@ -337,7 +352,6 @@ public:
         }
         record.qual = std::move(qual_buf_);
 
-        last_line_read_ = false;
         return true;
     }
 

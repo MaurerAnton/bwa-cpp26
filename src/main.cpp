@@ -167,6 +167,29 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Test FASTA reading
+        {
+            io::SeqReader reader("/tmp/test_debug.fq");
+            if (!reader.is_open()) {
+                std::cout << "  FASTA read: FAIL (can't open file)\n";
+            } else {
+                io::SeqRecord rec;
+                int count = 0;
+                while (true) {
+                    auto result = reader.read(rec);
+                    if (!result) break;
+                    if (!*result) break;
+                    count++;
+                    std::cout << "  FASTA read: record " << count
+                              << " name='" << rec.name.view() << "'"
+                              << " seq_len=" << rec.seq.size()
+                              << " seq='" << rec.seq.view() << "'"
+                              << " is_fasta=" << rec.is_fasta() << "\n";
+                }
+                std::cout << "  FASTA read: " << count << " records\n";
+            }
+        }
+
         std::cout << "All tests passed!\n";
         return 0;
     }
