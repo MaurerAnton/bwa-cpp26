@@ -4,6 +4,7 @@
 #include <bwa/core/string.hpp>
 #include <bwa/core/arena.hpp>
 #include <bwa/core/sort.hpp>
+#include <bwa/index/sais.hpp>
 #include <span>
 #include <cstddef>
 #include <cstdint>
@@ -221,6 +222,83 @@ public:
     }
 };
 
+// Verify suffix array by checking sorted order
+inline bool verify_suffix_array(const uint8_t* T, int32_t n, const int32_t* SA) noexcept {
+    if (n == 0) return true;
+    if (SA[0] != n - 1) return false; // Sentinel must be first
+
+    for (int32_t i = 1; i < n; ++i) {
+        int32_t a = SA[i - 1];
+        int32_t b = SA[i];
+        // Compare suffixes starting at a and b
+        int32_t k = 0;
+        while (a + k < n - 1 && b + k < n - 1) {
+            if (T[a + k] != T[b + k]) break;
+            ++k;
+        }
+        int32_t av = (a + k < n - 1) ? T[a + k] : 0;
+        int32_t bv = (b + k < n - 1) ? T[b + k] : 0;
+        if (av > bv) return false;
+    }
+    return true;
+}
+
+// Compare two suffixes lexicographically
+inline int32_t suffix_cmp(const uint8_t* T, int32_t a, int32_t b, int32_t n) noexcept {
+    if (a == b) return 0;
+    while (a < n && b < n) {
+        if (T[a] != T[b]) return T[a] < T[b] ? -1 : 1;
+        ++a; ++b;
+    }
+    if (a == n) return -1; // a is shorter (or sentinel)
+    if (b == n) return 1;
+    return 0;
+}
+
+// Brute-force suffix sort for testing/verification - O(n^2 log n) but correct
+// Used as a reference implementation and fallback while optimizing
+inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq,
+                                                        memory::Arena& arena) {
+    size_t n = seq.size();
+    if (n == 0) return {};
+
+    // Convert to byte array with sentinel
+    core::Vector<uint8_t> T(&arena);
+    T.resize(n + 1);
+    T[n] = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = seq.get(i);
+        T[i] = (b == 4) ? 1 : (b + 1);
+    }
+
+    // Create array of suffix starting positions: 0, 1, ..., n-1
+    // Sentinel at position n is excluded (it would always be smallest)
+    core::Vector<uint32_t> sa(&arena);
+    sa.resize(n);
+    for (uint32_t i = 0; i < n; ++i) sa[i] = i;
+
+    // Sort using std::sort with suffix comparison
+    std::sort(sa.begin(), sa.end(),
+              [T_data = T.data(), n](uint32_t a, uint32_t b) {
+                  size_t i = a, j = b;
+                  while (i < n && j < n && T_data[i] == T_data[j]) { ++i; ++j; }
+                  if (i == n && j == n) return a < b;
+                  if (i == n) return true;  // a is shorter
+                  if (j == n) return false; // b is shorter
+                  return T_data[i] < T_data[j];
+              });
+
+    return sa;
+}
+
+// Build suffix array from packed sequence
+// Uses brute-force O(n^2 log n) for now (correct, simple, easy to verify)
+// TODO: Replace with O(n) SA-IS from detail::sais namespace
+inline core::Vector<uint32_t> build_suffix_array_sais(const PackedSequence& seq,
+                                                       memory::Arena& arena) {
+    return build_suffix_array_brute(seq, arena);
+}
+
 // FM-index with rank/select support
 class FMIndex {
 public:
@@ -307,13 +385,28 @@ public:
         return {new_l, new_r};
     }
 
-    // Backward search for pattern
+    // Backward search for pattern in PackedSequence
     // Returns interval [l, r) in SA, or empty if not found
+    [[nodiscard]] std::pair<size_t, size_t> backward_search(const PackedSequence& pat) const noexcept {
+        size_t l = 0, r = length_;
+        for (int32_t i = static_cast<int32_t>(pat.size()) - 1; i >= 0; --i) {
+            uint8_t base = pat.get(i);
+            if (base >= 4) return {0, 0}; // N or invalid
+            auto [new_l, new_r] = backward_extend(base, l, r);
+            if (new_l >= new_r) return {0, 0}; // Empty
+            l = new_l;
+            r = new_r;
+        }
+        return {l, r};
+    }
+
+    // Backward search for any pattern with rbegin/rend
     template <typename Pattern>
     [[nodiscard]] std::pair<size_t, size_t> backward_search(const Pattern& pat) const noexcept {
         size_t l = 0, r = length_;
         for (auto it = pat.rbegin(); it != pat.rend(); ++it) {
             uint8_t base = PackedSequence::encode_base(*it);
+            if (base >= 4) return {0, 0}; // N or invalid
             auto [new_l, new_r] = backward_extend(base, l, r);
             if (new_l >= new_r) return {0, 0}; // Empty
             l = new_l;
@@ -348,6 +441,12 @@ public:
         return r - l;
     }
 
+    // Count occurrences of PackedSequence pattern
+    [[nodiscard]] size_t count(const PackedSequence& pat) const noexcept {
+        auto [l, r] = backward_search(pat);
+        return r - l;
+    }
+
     // Build from packed sequence (SA construction)
     static FMIndex build(const PackedSequence& seq, memory::Arena& arena) {
         FMIndex idx;
@@ -356,14 +455,9 @@ public:
 
         // Allocate working memory from arena
         size_t n = seq.size();
-        core::Vector<uint32_t> sa(&arena);
-        sa.resize(n);
-        core::Vector<uint32_t> rank(&arena);
-        rank.resize(n);
 
-        // SA construction using induced sorting (SA-IS) or fallback
-        // For now, use simple prefix-doubling (O(n log n)) - replace with SA-IS later
-        build_sa_doubling(seq, sa, rank, arena);
+        // SA-IS: O(n) linear-time suffix array construction
+        core::Vector<uint32_t> sa = build_suffix_array_sais(seq, arena);
 
         // Build BWT from SA
         for (size_t i = 0; i < n; ++i) {

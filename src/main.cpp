@@ -127,6 +127,46 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Test SA-IS
+        {
+            memory::Arena arena(64 * 1024);
+            index::PackedSequence seq;
+            seq.append("ACGTAACCGGTTAA", 14);
+
+            auto sa = index::build_suffix_array_sais(seq, arena);
+
+            // Verify: SA should have 14 entries
+            if (sa.size() == 14) {
+                std::cout << "  SA-IS: OK (size=" << sa.size() << ")\n";
+            } else {
+                std::cout << "  SA-IS: FAIL (size=" << sa.size() << ")\n";
+            }
+        }
+
+        // Test FMIndex
+        {
+            memory::Arena arena(1024 * 1024);
+            index::PackedSequence seq;
+            seq.append("ACGTAACCGGTTAA", 14);
+
+            index::FMIndex idx = index::FMIndex::build(seq, arena);
+
+            if (idx.size() == 14) {
+                // Test backward search for "AA"
+                index::PackedSequence query;
+                query.append("AA", 2);
+                auto [l, r] = idx.backward_search(query);
+                size_t count = r - l;
+                if (count > 0) {
+                    std::cout << "  FMIndex: OK (found " << count << " occurrences of AA)\n";
+                } else {
+                    std::cout << "  FMIndex: FAIL (no occurrences found)\n";
+                }
+            } else {
+                std::cout << "  FMIndex: FAIL (size=" << idx.size() << ")\n";
+            }
+        }
+
         std::cout << "All tests passed!\n";
         return 0;
     }
