@@ -66,6 +66,7 @@ public:
 
     [[nodiscard]] uint8_t get(size_t pos) const noexcept {
         if (pos >= length_) return ENCODE_N;
+        if (is_n(pos)) return ENCODE_N;
         size_t wi = word_index(pos);
         int bo = bit_offset(pos);
         return static_cast<uint8_t>((data_[wi] >> bo) & MASK);
@@ -81,7 +82,9 @@ public:
         if (pos >= length_) return;
         size_t wi = word_index(pos);
         int bo = bit_offset(pos);
-        data_[wi] = (data_[wi] & ~(word_type(MASK) << bo)) | (word_type(base & MASK) << bo);
+        // Store N as 0 in data, use N mask to distinguish
+        uint8_t stored = (base == ENCODE_N) ? 0 : (base & MASK);
+        data_[wi] = (data_[wi] & ~(word_type(MASK) << bo)) | (word_type(stored) << bo);
 
         size_t nwi = n_word_index(pos);
         int nbo = n_bit_offset(pos);

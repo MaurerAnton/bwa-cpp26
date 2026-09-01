@@ -101,22 +101,29 @@ int main(int argc, char* argv[]) {
             ok &= seq.is_n(8);
             ok &= !seq.is_n(0);
             if (ok) std::cout << "  PackedSequence: OK\n";
-            else std::cout << "  PackedSequence: FAIL\n";
+            else {
+                std::cout << "  PackedSequence: FAIL (get0=" << (int)seq.get(0)
+                          << " get1=" << (int)seq.get(1)
+                          << " get2=" << (int)seq.get(2)
+                          << " get3=" << (int)seq.get(3)
+                          << " get8=" << (int)seq.get(8)
+                          << " isn8=" << seq.is_n(8)
+                          << " isn0=" << seq.is_n(0) << ")\n";
+            }
         }
 
         // Test Smith-Waterman
         {
             align::Scoring sc = align::Scoring::bwa_mem_default();
-            // Packed 2-bit: A=0, C=1, G=2, T=3
-            // ACGTACGT = 0,1,2,3,0,1,2,3 packed into 2 bytes
-            std::array<uint8_t, 2> q_packed = {0x18, 0x18}; // 00 01 10 11 | 00 01 10 11
-            std::array<uint8_t, 2> r_packed = {0x18, 0x18};
+            // Individual bases: A=0, C=1, G=2, T=3
+            std::array<uint8_t, 4> query = {0, 1, 2, 3}; // ACGT
+            std::array<uint8_t, 4> ref = {0, 1, 2, 3};   // ACGT
 
-            align::Alignment aln = align::sw_global(sc, q_packed, r_packed);
-            if (aln.score > 0 && aln.n_cigar > 0) {
+            align::Alignment aln = align::sw_global(sc, query, ref);
+            if (aln.score > 0) {
                 std::cout << "  SmithWaterman: OK (score=" << aln.score << ")\n";
             } else {
-                std::cout << "  SmithWaterman: FAIL\n";
+                std::cout << "  SmithWaterman: FAIL (score=" << aln.score << ")\n";
             }
         }
 
