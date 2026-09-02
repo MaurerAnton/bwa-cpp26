@@ -159,11 +159,17 @@ public:
     [[nodiscard]] std::span<const word_type> n_masks() const noexcept { return {n_mask_.data(), n_mask_.size()}; }
 
     // Get sequence as packed bytes (2 bits per base)
+    // Returns a span that is valid as long as the PackedSequence is not modified
+    // For now, we allocate a temporary buffer - this is not ideal for performance
+    // but is correct. A better implementation would use a cached buffer.
+    mutable std::vector<uint8_t> unpacked_cache_;
     [[nodiscard]] std::span<const uint8_t> bases() const noexcept {
-        // PackedSequence stores 2 bits per base in words, but we need bytes for MEM finder
-        // For now, return a view of the underlying byte data
-        // This is a simplification - in reality we'd need to unpack
-        return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data_.data()), length_);
+        // Unpack 2-bit bases into a byte array
+        unpacked_cache_.resize(length_);
+        for (size_t i = 0; i < length_; ++i) {
+            unpacked_cache_[i] = get(i);
+        }
+        return std::span<const uint8_t>(unpacked_cache_.data(), length_);
     }
 
     // Static encoding/decoding
@@ -423,7 +429,7 @@ public:
         }
         // Walk backward using LF until sampled
         size_t steps = 0;
-        while (pos % SA_INTERVAL != 0 && steps < SA_INTERVAL) {
+        while (pos % SA_INTERVAL != 0 && steps < length_) {
             pos = lf(pos);
             ++steps;
         }
@@ -562,6 +568,12 @@ public:
     void add_sequence(const PackedSequence& seq, memory::Arena& arena) {
         indexes_.push_back(FMIndex::build(seq, arena));
         offsets_.push_back(offsets_.empty() ? seq.size() : offsets_.back() + seq.size());
+    }
+
+    void add_index(FMIndex idx) {
+        size_t len = idx.length();
+        indexes_.push_back(std::move(idx));
+        offsets_.push_back(offsets_.empty() ? len : offsets_.back() + len);
     }
 
     [[nodiscard]] size_t num_sequences() const noexcept { return indexes_.size(); }

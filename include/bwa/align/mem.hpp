@@ -69,38 +69,39 @@ public:
         int32_t qlen = static_cast<int32_t>(query.size());
         if (qlen < min_seed_len_) return;
 
-        int32_t i = 0;
-        while (i < qlen) {
-            // Skip N's
-            while (i < qlen && query[i] >= 4) ++i;
-            if (i >= qlen) break;
+        // Use backward search: process query from right to left
+        int32_t i = qlen - 1;
+        while (i >= 0) {
+            // Skip N's (from right)
+            while (i >= 0 && query[i] >= 4) --i;
+            if (i < 0) break;
 
-            // Extend as long as possible
+            // Extend backward as long as possible
             int32_t l = 0, r = fm_index_.length();
             int32_t j = i;
             int32_t best_l = l, best_r = r, best_j = j;
 
-            while (j < qlen && query[j] < 4) {
+            while (j >= 0 && query[j] < 4) {
                 uint8_t base = query[j];
                 auto [new_l, new_r] = fm_index_.backward_extend(base, l, r);
                 if (new_l >= new_r) break;
                 l = new_l;
                 r = new_r;
-                ++j;
+                --j;
 
-                // Check if this is a MEM (occurrence count is 1 or we hit max_occ)
+                // Check if this is a MEM (occurrence count is acceptable)
                 int32_t occ = r - l;
                 if (occ <= max_occ_) {
                     best_l = l; best_r = r; best_j = j;
                 }
             }
 
-            int32_t mem_len = best_j - i;
+            int32_t mem_len = i - best_j;
             if (mem_len >= min_seed_len_) {
                 // Get reference position (sampled SA)
                 if (auto pos = fm_index_.locate(best_l)) {
                     MEM mem;
-                    mem.query_pos = i;
+                    mem.query_pos = best_j + 1;
                     mem.ref_pos = *pos;
                     mem.len = mem_len;
                     mem.score = mem_len * match_score_;
@@ -109,8 +110,8 @@ public:
                 }
             }
 
-            // Move to next position
-            if (j == i) ++i;
+            // Move to next position (from right)
+            if (j == i) --i;
             else i = j;
         }
     }

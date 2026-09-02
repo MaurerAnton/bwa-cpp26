@@ -235,7 +235,7 @@ int main(int argc, char* argv[]) {
 
     if (cmd == "mem") {
         if (argc < 4) {
-            std::cerr << "Usage: " << argv[0] << " mem <index> <fastq> [fastq2]\n";
+            std::cerr << "Usage: " << argv[0] << " mem <index> <fastq> [fastq2] [sam_out]\n";
             return 1;
         }
         std::cout << "Loading index " << argv[2] << "...\n";
@@ -246,12 +246,40 @@ int main(int argc, char* argv[]) {
                   << std::chrono::duration_cast<std::chrono::milliseconds>(load_end - start).count()
                   << " ms\n";
 
-        if (argc == 4) {
-            std::cout << "Aligning single-end " << argv[3] << "...\n";
-            pipe.align_file(argv[3]);
-        } else if (argc == 5) {
+        // Parse args:
+        //   argc==4: mem <index> <fastq>            → single-end, stdout
+        //   argc==5: mem <index> <fastq1> <fastq2>  → paired-end, stdout
+        //   argc==5: mem <index> <fastq> <sam_out>  → single-end to file
+        //   argc==6: mem <index> <fastq1> <fastq2> <sam_out> → paired-end to file
+        // Heuristic: if the 4th arg ends in .sam or .bam, treat as sam_out
+        bool has_fastq2 = false;
+        if (argc == 5) {
+            std::string_view arg4 = argv[4];
+            bool looks_like_sam = (arg4.size() >= 4 &&
+                                   (arg4.substr(arg4.size()-4) == ".sam" ||
+                                    arg4.substr(arg4.size()-4) == ".bam"));
+            if (!looks_like_sam) {
+                std::ifstream test(argv[4]);
+                if (test.good()) {
+                    has_fastq2 = true;
+                }
+                test.close();
+            }
+        }
+
+        const char* sam_out = "-";
+        if (argc == 5 && !has_fastq2) {
+            sam_out = argv[4];
+        } else if (argc >= 6) {
+            sam_out = argv[5];
+        }
+
+        if (has_fastq2) {
             std::cout << "Aligning paired-end " << argv[3] << " " << argv[4] << "...\n";
-            pipe.align_pair(argv[3], argv[4]);
+            pipe.align_pair(argv[3], argv[4], sam_out);
+        } else {
+            std::cout << "Aligning single-end " << argv[3] << "...\n";
+            pipe.align_file(argv[3], sam_out);
         }
         return 0;
     }

@@ -19,10 +19,10 @@ namespace bwa {
 // Main configuration
 struct Config {
     // Algorithm parameters
-    int min_seed_len = 19;        // Minimum seed length
+    int min_seed_len = 11;        // Minimum seed length
     int max_occ = 500;            // Max occurrences for a seed
     int max_gap = 10000;          // Max gap in chaining
-    int min_chain_score = 30;     // Minimum chain score
+    int min_chain_score = 10;     // Minimum chain score
     int max_chain_gap = 10000;    // Max gap between chains
     int band_width = 32;          // Band width for SW extension
     int max_score_drop = 100;     // Max score drop for early termination
@@ -74,19 +74,20 @@ struct ReadGroup {
 };
 
 // Alignment record (SAM-compatible)
+// Uses std::string/std::vector for persistent storage (arena-safe)
 struct AlnRecord {
-    core::PmrString qname;          // Query name
+    std::string qname;          // Query name
     uint32_t flag = 0;        // SAM flag
-    core::PmrString rname;          // Reference name
+    std::string rname;          // Reference name
     int32_t pos = 0;          // 1-based position
     uint8_t mapq = 0;         // MAPQ
-    core::Vector<uint32_t> cigar;   // CIGAR
-    core::PmrString rnext = "*";    // Mate reference
+    std::vector<uint32_t> cigar;   // CIGAR
+    std::string rnext = "*";    // Mate reference
     int32_t pnext = 0;        // Mate position
     int32_t tlen = 0;         // Template length
-    core::PmrString seq;            // Query sequence
-    core::PmrString qual;           // Query quality
-    core::Vector<std::pair<core::PmrString, core::PmrString>> tags; // Optional tags
+    std::string seq;            // Query sequence
+    std::string qual;           // Query quality
+    std::vector<std::pair<std::string, std::string>> tags; // Optional tags
 
     // Computed fields
     int32_t score = 0;
@@ -177,8 +178,8 @@ private:
 // Alignment result for a single read
 struct AlignmentResult {
     AlnRecord primary;
-    core::Vector<AlnRecord> secondary;
-    core::Vector<AlnRecord> supplementary;
+    std::vector<AlnRecord> secondary;
+    std::vector<AlnRecord> supplementary;
     bool mapped = false;
     int32_t best_score = 0;
     int32_t second_best_score = 0;
@@ -278,31 +279,49 @@ public:
     // Align FASTQ file to SAM output
     void align_file(const char* fastq_path, const char* sam_path = "-") const {
         io::SeqReader reader(fastq_path);
-        io::SeqWriter writer(sam_path, "wb");
-        write_header(writer);
+        std::ofstream sam_out;
+        if (std::string_view(sam_path) != "-") {
+            sam_out.open(sam_path, std::ios::binary);
+            if (!sam_out) {
+                throw std::runtime_error("Cannot open SAM output file");
+            }
+        }
+
+        write_header(sam_out);
 
         aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-            write_alignment(writer, result);
+            write_alignment(sam_out, result);
         });
+
+        if (sam_out.is_open()) sam_out.close();
     }
 
     // Align paired FASTQ files
     void align_pair(const char* fastq1, const char* fastq2, const char* sam_path = "-") const {
         io::SeqReader r1(fastq1), r2(fastq2);
-        io::SeqWriter writer(sam_path, "wb");
-        write_header(writer);
+        std::ofstream sam_out;
+        if (std::string_view(sam_path) != "-") {
+            sam_out.open(sam_path, std::ios::binary);
+            if (!sam_out) {
+                throw std::runtime_error("Cannot open SAM output file");
+            }
+        }
+
+        write_header(sam_out);
 
         io::SeqRecord read1, read2;
         while (r1.read(read1) && r2.read(read2)) {
             AlignmentResult result = aligner_.align_pair(read1, read2);
-            write_alignment(writer, result);
+            write_alignment(sam_out, result);
             memory::reset_tls_arena();
         }
+
+        if (sam_out.is_open()) sam_out.close();
     }
 
 private:
-    void write_header(const io::SeqWriter& writer) const;
-    void write_alignment(const io::SeqWriter& writer, const AlignmentResult& result) const;
+    void write_header(std::ostream& out) const;
+    void write_alignment(std::ostream& out, const AlignmentResult& result) const;
 };
 
 } // namespace bwa

@@ -535,6 +535,16 @@ public:
             gzflush(gz_.get(), Z_SYNC_FLUSH);
         }
     }
+
+    // Write raw bytes (for SAM/BAM headers, etc.)
+    [[nodiscard]] bool puts(std::string_view text) noexcept {
+        if (!gz_.is_open()) return false;
+        int n = gzwrite(gz_.get(), text.data(), static_cast<unsigned>(text.size()));
+        return n == static_cast<int>(text.size());
+    }
+
+    // Get the underlying gzFile (for advanced use)
+    [[nodiscard]] gzFile handle() const noexcept { return gz_.get(); }
 };
 
 } // namespace bwa::io
