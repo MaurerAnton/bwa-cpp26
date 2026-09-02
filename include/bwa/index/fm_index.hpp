@@ -422,22 +422,28 @@ public:
     }
 
     // Locate: get SA value at position (requires sampled SA)
+    // We walk forward from the nearest sampled position <= pos using LF.
+    // LF maps position i to the position of the suffix that starts one position
+    // earlier in the original text, so SA[LF(i)] = (SA[i] - 1 + n) % n.
     [[nodiscard]] std::optional<uint32_t> locate(size_t pos) const noexcept {
         if (sa_.empty()) return std::nullopt;
-        if (pos % SA_INTERVAL == 0) {
-            return sa_[pos / SA_INTERVAL];
+        if (pos >= length_) return std::nullopt;
+
+        // Find the largest sampled position <= pos
+        size_t sampled_pos = (pos / SA_INTERVAL) * SA_INTERVAL;
+        if (sampled_pos > pos) sampled_pos -= SA_INTERVAL;
+
+        // Walk forward from sampled_pos to pos, counting steps
+        size_t steps = pos - sampled_pos;
+        size_t cur = sampled_pos;
+        for (size_t s = 0; s < steps; ++s) {
+            cur = lf(cur);
         }
-        // Walk backward using LF until sampled
-        size_t steps = 0;
-        while (pos % SA_INTERVAL != 0 && steps < length_) {
-            pos = lf(pos);
-            ++steps;
-        }
-        if (pos % SA_INTERVAL == 0) {
-            auto base_sa = sa_[pos / SA_INTERVAL];
-            return base_sa + steps < length_ ? std::optional(base_sa + steps) : std::nullopt;
-        }
-        return std::nullopt;
+
+        // Get the SA value at sampled_pos and subtract steps
+        auto base_sa = sa_[sampled_pos / SA_INTERVAL];
+        size_t result = (base_sa + length_ - steps) % length_;
+        return static_cast<uint32_t>(result);
     }
 
     // Count occurrences of pattern

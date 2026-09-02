@@ -211,6 +211,68 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Test end-to-end alignment pipeline
+        {
+            // Create a temporary FASTA file
+            const char* fasta_path = "/tmp/bwa_test_ref.fa";
+            const char* idx_prefix = "/tmp/bwa_test_idx";
+            const char* sam_path = "/tmp/bwa_test_aln.sam";
+
+            // Write test reference
+            {
+                std::ofstream f(fasta_path);
+                f << ">test_chr1\n";
+                f << "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
+                f << "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n";
+            }
+
+            // Build index
+            Index idx = Index::build(fasta_path);
+            idx.save(idx_prefix);
+
+            // Reload index
+            Index idx2 = Index::load(idx_prefix);
+
+            // Create test read (exact match)
+            io::SeqRecord read;
+            read.name = "read1";
+            read.seq = "ACGTACGTACGTACGTACGT";
+            read.qual = "IIIIIIIIIIIIIIIIIIII";
+
+            // Align
+            Aligner aligner(idx2);
+            AlignmentResult result = aligner.align(read);
+
+            if (result.mapped && result.primary.score > 0) {
+                // Check CIGAR
+                bool has_match = false;
+                for (uint32_t c : result.primary.cigar) {
+                    auto op = static_cast<align::CigarOp>(c & 0xF);
+                    if (op == align::CigarOp::Equal || op == align::CigarOp::Match) {
+                        has_match = true;
+                        break;
+                    }
+                }
+                if (has_match) {
+                    std::cout << "  EndToEnd: OK (pos=" << result.primary.pos
+                              << " score=" << result.primary.score << ")\n";
+                } else {
+                    std::cout << "  EndToEnd: FAIL (no match in CIGAR)\n";
+                }
+            } else {
+                std::cout << "  EndToEnd: FAIL (not mapped or score=0)\n";
+            }
+
+            // Cleanup
+            std::remove(fasta_path);
+            std::remove((std::string(idx_prefix) + ".meta").c_str());
+            std::remove((std::string(idx_prefix) + ".bwt").c_str());
+            std::remove((std::string(idx_prefix) + ".sa").c_str());
+            std::remove((std::string(idx_prefix) + ".occ").c_str());
+            std::remove((std::string(idx_prefix) + ".pac").c_str());
+            std::remove(sam_path);
+        }
+
         std::cout << "All tests passed!\n";
         return 0;
     }
