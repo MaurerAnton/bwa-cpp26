@@ -297,11 +297,210 @@ inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq
     return sa;
 }
 
-// Build suffix array from packed sequence
-// Uses brute-force O(n^2 log n) for now (correct, simple, easy to verify)
-// TODO: Replace with O(n) SA-IS from detail::sais namespace
+// SA-IS (Suffix Array - Induced Sorting) - O(n) suffix array construction
+// Based on the algorithm by Nong, Zhang, and Chan (2009)
+// For DNA sequences with alphabet {0, 1, 2, 3} (A, C, G, T)
+namespace detail::sais {
+
+// Check if position i is L-type (suffix T[i..] is lexicographically larger than T[i+1..])
+inline bool is_L_type(const uint8_t* T, int32_t n, int32_t i,
+                      const std::vector<bool>& is_l) {
+    if (i == n - 1) return false; // Last position is S-type by definition
+    return is_l[i];
+}
+
+// Get LMS-suffixes (Leftmost S-type) - S-type positions preceded by L-type
+inline void find_lms_positions(const uint8_t* T, int32_t n,
+                                const std::vector<bool>& is_l,
+                                std::vector<int32_t>& lms_positions) {
+    for (int32_t i = 1; i < n; ++i) {
+        if (!is_l[i] && is_l[i - 1]) {
+            lms_positions.push_back(i);
+        }
+    }
+}
+
+// Compare two LMS-substrings
+inline int lms_substring_cmp(const uint8_t* T, int32_t n, int32_t a, int32_t b,
+                              const std::vector<int32_t>& lms_set) {
+    if (a == b) return 0;
+    int32_t i = a, j = b;
+    int32_t k = 0;
+    while (i < n && j < n && k < n) {
+        bool a_is_lms = lms_set[i] == 1;
+        bool b_is_lms = lms_set[j] == 1;
+        if (k > 0 && a_is_lms && b_is_lms) return 0;
+        if (T[i] != T[j]) return T[i] < T[j] ? -1 : 1;
+        ++i; ++j; ++k;
+        if (i == n && j == n) return 0;
+    }
+    return 0;
+}
+
+// SA-IS main function
+inline void sais_main(const uint8_t* T, int32_t n, int32_t* SA, int32_t fs, int32_t nmax) {
+    if (n == 0) return;
+    if (n == 1) { SA[0] = 0; return; }
+
+    // Step 1: Classify suffixes as L-type or S-type
+    std::vector<bool> is_l(n, false);
+    is_l[n - 1] = false; // Last suffix is S-type
+    for (int32_t i = n - 2; i >= 0; --i) {
+        if (T[i] < T[i + 1]) {
+            is_l[i] = true;
+        } else if (T[i] > T[i + 1]) {
+            is_l[i] = false;
+        } else {
+            is_l[i] = is_l[i + 1];
+        }
+    }
+
+    // Step 2: Find LMS-suffixes
+    std::vector<int32_t> lms_positions;
+    find_lms_positions(T, n, is_l, lms_positions);
+    int32_t n_lms = static_cast<int32_t>(lms_positions.size());
+
+    if (n_lms == 0) {
+        // No LMS-suffixes, fill SA with all positions in order
+        for (int32_t i = 0; i < n; ++i) SA[i] = i;
+        return;
+    }
+
+    // Step 3: Sort LMS-suffixes using bucket sort and induced sorting
+    // Initialize buckets
+    int32_t sigma = 256; // ASCII alphabet
+    std::vector<int32_t> bucket_start(sigma, 0);
+    std::vector<int32_t> bucket_end(sigma, 0);
+    std::vector<int32_t> bucket_count(sigma, 0);
+
+    for (int32_t i = 0; i < n; ++i) bucket_count[T[i]]++;
+    int32_t sum = 0;
+    for (int c = 0; c < sigma; ++c) {
+        bucket_start[c] = sum;
+        sum += bucket_count[c];
+        bucket_end[c] = sum;
+    }
+
+    // Initialize SA to -1
+    std::fill_n(SA, n, -1);
+
+    // Place LMS-suffixes at the ends of their buckets
+    for (auto it = lms_positions.rbegin(); it != lms_positions.rend(); ++it) {
+        int32_t p = *it;
+        SA[--bucket_end[T[p]]] = p;
+    }
+
+    // Induced sorting: L-type
+    int32_t l_pos = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        if (SA[i] > 0) {
+            int32_t j = SA[i] - 1;
+            if (is_l[j]) {
+                SA[bucket_start[T[j]]++] = j;
+            }
+        }
+    }
+
+    // Induced sorting: S-type
+    for (int32_t i = n - 1; i >= 0; --i) {
+        if (SA[i] > 0) {
+            int32_t j = SA[i] - 1;
+            if (!is_l[j]) {
+                SA[--bucket_end[T[j]]] = j;
+            }
+        }
+    }
+
+    // Step 4: Compact LMS-suffixes to the beginning of SA
+    std::vector<int32_t> lms_sorted(n_lms);
+    int32_t idx = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        if (SA[i] > 0 && !is_l[SA[i]] && is_l[SA[i] - 1]) {
+            lms_sorted[idx++] = SA[i];
+        }
+    }
+
+    // Step 5: Name the LMS-suffixes
+    int32_t name = 0;
+    int32_t prev = -1;
+    std::vector<int32_t> sa_lms(n, -1);
+    for (int32_t i = 0; i < n_lms; ++i) {
+        int32_t pos = lms_sorted[i];
+        bool diff = false;
+        if (prev == -1) {
+            diff = true;
+        } else {
+            int32_t a = prev, b = pos;
+            // Compare LMS-substrings
+            int32_t k = 0;
+            while (a < n && b < n && k < n) {
+                bool a_is_lms = (k > 0 && !is_l[a] && is_l[a - 1]) || a == prev;
+                bool b_is_lms = (k > 0 && !is_l[b] && is_l[b - 1]) || b == pos;
+                if (T[a] != T[b]) { diff = true; break; }
+                bool a_end = (k > 0 && !is_l[a] && is_l[a - 1]);
+                bool b_end = (k > 0 && !is_l[b] && is_l[b - 1]);
+                if (a_end != b_end) { diff = true; break; }
+                if (a_end && b_end) break;
+                ++a; ++b; ++k;
+            }
+        }
+        if (diff) { ++name; prev = pos; }
+        sa_lms[i] = name - 1;
+    }
+
+    // Step 6: If all names are unique, we're done; otherwise recurse
+    if (name < n_lms) {
+        // Create reduced problem
+        std::vector<int32_t> t_new(n_lms);
+        for (int32_t i = 0; i < n_lms; ++i) t_new[i] = sa_lms[i];
+        std::vector<int32_t> sa_new(n_lms);
+        sais_main(t_new.data(), n_lms, sa_new.data(), 0, n_lms);
+
+        // Map back to original positions
+        std::vector<int32_t> lms_sorted2(n_lms);
+        for (int32_t i = 0; i < n_lms; ++i) {
+            lms_sorted2[i] = lms_positions[sa_new[i]];
+        }
+        lms_sorted = lms_sorted2;
+    }
+
+    // Step 7: Final induced sorting with sorted LMS-suffixes
+    std::fill_n(SA, n, -1);
+    for (auto it = lms_sorted.rbegin(); it != lms_sorted.rend(); ++it) {
+        int32_t p = *it;
+        SA[--bucket_end[T[p]]] = p;
+    }
+
+    // Induced sorting: L-type
+    for (int32_t i = 0; i < n; ++i) {
+        if (SA[i] > 0) {
+            int32_t j = SA[i] - 1;
+            if (is_l[j]) {
+                SA[bucket_start[T[j]]++] = j;
+            }
+        }
+    }
+
+    // Induced sorting: S-type
+    for (int32_t i = n - 1; i >= 0; --i) {
+        if (SA[i] > 0) {
+            int32_t j = SA[i] - 1;
+            if (!is_l[j]) {
+                SA[--bucket_end[T[j]]] = j;
+            }
+        }
+    }
+}
+
+} // namespace detail::sais
+
+// Build suffix array using SA-IS algorithm - O(n) time
+// Currently falls back to brute-force for correctness; SA-IS implementation
+// needs more debugging for edge cases.
 inline core::Vector<uint32_t> build_suffix_array_sais(const PackedSequence& seq,
                                                        memory::Arena& arena) {
+    // Use brute-force for now (correct, O(n^2 log n))
+    // The SA-IS implementation in detail::sais is a work in progress
     return build_suffix_array_brute(seq, arena);
 }
 
