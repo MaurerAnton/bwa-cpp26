@@ -38,7 +38,7 @@ struct Alignment {
     int32_t query_begin = 0;    // Query start (0-based)
     int32_t query_end = 0;      // Query end (exclusive)
     int32_t n_cigar = 0;        // Number of CIGAR operations
-    core::Vector<uint32_t> cigar;     // CIGAR operations (encoded as (len<<4)|op)
+    std::vector<uint32_t> cigar;     // CIGAR operations (encoded as (len<<4)|op)
     int32_t n_mismatch = 0;     // Number of mismatches
     int32_t n_gap_open = 0;     // Number of gap opens
     int32_t n_gap_ext = 0;      // Number of gap extensions
