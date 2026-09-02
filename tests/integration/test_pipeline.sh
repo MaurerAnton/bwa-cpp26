@@ -40,7 +40,7 @@ echo "=== Building index ==="
 $BWA_CPP26 index $TEST_DIR/ref.fa $TEST_DIR/test_idx
 
 # Verify index files exist
-for ext in meta bwt sa occ; do
+for ext in meta bwt sa occ pac; do
     if [ ! -f $TEST_DIR/test_idx.$ext ]; then
         echo "FAIL: Missing index file: test_idx.$ext"
         exit 1

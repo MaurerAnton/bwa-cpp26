@@ -107,16 +107,18 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     const auto& ref_seq = index_.references()[0];
-    const auto& fm = index_.fm_index()[0];
-
-    // Get reference position from the first MEM
-    int32_t ref_pos = best_chain.mems[0].ref_pos;
     int32_t ref_len = static_cast<int32_t>(ref_seq.length);
     int32_t query_len = static_cast<int32_t>(read.seq.size());
 
-    // Clip reference to valid range
-    int32_t ref_begin = std::max<int32_t>(0, ref_pos - config_.band_width);
-    int32_t ref_end = std::min<int32_t>(ref_len, ref_pos + query_len + config_.band_width);
+    // Get reference position from the first MEM
+    int32_t ref_pos = best_chain.mems[0].ref_pos;
+    int32_t chain_query_begin = best_chain.mems.front().query_pos;
+    int32_t chain_ref_begin = best_chain.mems.front().ref_pos;
+
+    // Calculate alignment region with padding
+    int32_t padding = config_.band_width * 2;
+    int32_t ref_begin = std::max<int32_t>(0, chain_ref_begin - padding);
+    int32_t ref_end = std::min<int32_t>(ref_len, chain_ref_begin + query_len + padding);
 
     if (ref_end <= ref_begin) {
         result.mapped = false;
@@ -124,53 +126,73 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     // Extract reference region
-    // For now, we cannot extract arbitrary regions from the FM-index without
-    // storing the original reference. We'll do banded alignment on a minimal
-    // region around the seed.
-    // In a real implementation, the index would store the packed reference.
+    auto ref_region = index_.extract_ref(ref_begin, ref_end);
+    if (ref_region.empty()) {
+        // No packed reference available - fall back to simple CIGAR from chain
+        result.mapped = true;
+        result.best_score = best_chain.score;
+        result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
+        result.primary.qname = std::string(read.name.view());
+        result.primary.rname = ref_seq.name;
+        result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
+        result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
+        result.primary.score = best_chain.score;
+        result.primary.seq = std::string(read.seq.view());
+        result.primary.qual = std::string(read.qual.view());
 
-    // For demonstration, do a simple alignment: just use the MEM positions
-    // and report a basic CIGAR based on the chain
-    result.mapped = true;
-    result.best_score = best_chain.score;
+        int32_t prev_query_end = 0;
+        for (const auto& mem : best_chain.mems) {
+            if (mem.query_pos > prev_query_end) {
+                int32_t clip_len = mem.query_pos - prev_query_end;
+                result.primary.cigar.push_back(
+                    align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+            }
+            result.primary.cigar.push_back(
+                align::encode_cigar(mem.len, align::CigarOp::Match));
+            prev_query_end = mem.query_end();
+        }
+        if (prev_query_end < query_len) {
+            int32_t clip_len = query_len - prev_query_end;
+            result.primary.cigar.push_back(
+                align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+        }
+        return;
+    }
+
+    // Convert query to span for SW
+    std::vector<uint8_t> query_bytes(query_len);
+    auto qbases = query.bases();
+    for (int32_t i = 0; i < query_len; ++i) {
+        query_bytes[i] = qbases[i];
+    }
+
+    // Run banded SW extension
+    align::Alignment sw_aln = align::sw_extend(
+        config_.scoring,
+        std::span<const uint8_t>(query_bytes.data(), query_len),
+        std::span<const uint8_t>(ref_region.data(), ref_region.size()),
+        0, 0, config_.band_width, config_.max_score_drop
+    );
+
+    // Calculate final alignment position
+    int32_t final_ref_begin = ref_begin + sw_aln.ref_begin;
+    int32_t final_ref_end = ref_begin + sw_aln.ref_end;
+
+    result.mapped = sw_aln.score > 0;
+    result.best_score = sw_aln.score;
     result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
 
     // Build primary alignment
     result.primary.qname = std::string(read.name.view());
     result.primary.rname = ref_seq.name;
-    result.primary.pos = std::max<int32_t>(1, ref_pos + 1); // SAM is 1-based
+    result.primary.pos = final_ref_begin + 1; // SAM is 1-based
     result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
-    result.primary.score = best_chain.score;
+    result.primary.score = sw_aln.score;
     result.primary.seq = std::string(read.seq.view());
     result.primary.qual = std::string(read.qual.view());
 
-    // Build CIGAR from chain MEMs
-    // For now, just concatenate MEM lengths as M operations
-    // (proper CIGAR requires SW extension which needs the reference)
-    int32_t prev_query_end = 0;
-    for (size_t i = 0; i < best_chain.mems.size(); ++i) {
-        const auto& mem = best_chain.mems[i];
-
-        // Add soft clip for any gap before this MEM
-        if (mem.query_pos > prev_query_end) {
-            int32_t clip_len = mem.query_pos - prev_query_end;
-            result.primary.cigar.push_back(
-                align::encode_cigar(clip_len, align::CigarOp::SoftClip));
-        }
-
-        // Add the MEM as a match
-        result.primary.cigar.push_back(
-            align::encode_cigar(mem.len, align::CigarOp::Match));
-
-        prev_query_end = mem.query_end();
-    }
-
-    // Add trailing soft clip if needed
-    if (prev_query_end < query_len) {
-        int32_t clip_len = query_len - prev_query_end;
-        result.primary.cigar.push_back(
-            align::encode_cigar(clip_len, align::CigarOp::SoftClip));
-    }
+    // Copy CIGAR from SW alignment
+    result.primary.cigar = sw_aln.cigar;
 }
 
 void Aligner::align_pair_impl(const io::SeqRecord& read1,
@@ -275,6 +297,9 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
             index::PackedSequence seq;
             seq.append(rec.seq.data(), rec.seq.size());
 
+            // Store packed reference for later extraction
+            packed_refs_.push_back(seq);
+
             fm_index_.add_sequence(seq, memory::get_tls_arena());
 
             refs_.push_back(std::move(ref));
@@ -333,6 +358,18 @@ void Index::save_impl(const char* prefix) const {
                       static_cast<std::streamsize>(fm.occ_table().size() * sizeof(uint32_t)));
     }
     occ_out.close();
+
+    // Save packed reference (for subsequence extraction)
+    std::string pac_path = std::string(prefix) + ".pac";
+    std::ofstream pac_out(pac_path, std::ios::binary);
+    if (!pac_out) {
+        throw std::runtime_error("Cannot open packed reference file for writing");
+    }
+    for (const auto& packed : packed_refs_) {
+        pac_out.write(reinterpret_cast<const char*>(packed.words().data()),
+                      static_cast<std::streamsize>(packed.words().size() * sizeof(uint64_t)));
+    }
+    pac_out.close();
 }
 
 void Index::load_impl(const char* prefix) {
@@ -437,5 +474,33 @@ void Index::load_impl(const char* prefix) {
 
         // Add to fm_index_
         fm_index_.add_index(std::move(idx));
+    }
+
+    // Load packed reference
+    std::string pac_path = std::string(prefix) + ".pac";
+    std::ifstream pac_in(pac_path, std::ios::binary);
+    if (!pac_in) {
+        // No packed reference - extract_ref will return empty
+        return;
+    }
+    pac_in.seekg(0, std::ios::end);
+    size_t pac_size = pac_in.tellg();
+    pac_in.seekg(0);
+    std::vector<uint64_t> pac_data(pac_size / sizeof(uint64_t));
+    pac_in.read(reinterpret_cast<char*>(pac_data.data()), pac_size);
+    pac_in.close();
+
+    // Distribute packed data among references
+    packed_refs_.resize(refs_.size());
+    size_t offset = 0;
+    for (size_t i = 0; i < refs_.size(); ++i) {
+        packed_refs_[i].resize(refs_[i].length);
+        for (size_t j = 0; j < refs_[i].length; ++j) {
+            size_t wi = offset / 32;
+            size_t bi = (offset % 32) * 2;
+            uint8_t val = (pac_data[wi] >> bi) & 0x3;
+            packed_refs_[i].set(j, val);
+            ++offset;
+        }
     }
 }

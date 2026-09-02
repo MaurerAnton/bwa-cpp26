@@ -133,6 +133,8 @@ class Index {
     index::MultiFMIndex fm_index_;
     std::vector<RefSequence> refs_;  // Heap-allocated, persistent
     std::string meta_;               // Heap-allocated, persistent
+    std::vector<index::PackedSequence> packed_refs_;  // Packed reference sequences (persistent)
+    std::vector<uint64_t> ref_concat_;  // Concatenated reference as packed bits (persistent)
 
 public:
     Index() = default;
@@ -167,6 +169,35 @@ public:
             if (refs_[i].name == name) return i;
         }
         return std::nullopt;
+    }
+
+    // Extract a packed reference subsequence [start, end) as uint8_t vector
+    [[nodiscard]] std::vector<uint8_t> extract_ref(size_t start, size_t end) const {
+        std::vector<uint8_t> result;
+        if (packed_refs_.empty() || start >= end) return result;
+
+        // Find which reference contains this range
+        for (size_t ri = 0; ri < refs_.size(); ++ri) {
+            const auto& ref = refs_[ri];
+            if (start >= ref.offset && start < ref.offset + ref.length) {
+                size_t local_start = start - ref.offset;
+                size_t local_end = std::min(end - ref.offset, ref.length);
+                const auto& packed = packed_refs_[ri];
+                result.reserve(local_end - local_start);
+                for (size_t i = local_start; i < local_end; ++i) {
+                    result.push_back(packed.get(i));
+                }
+                return result;
+            }
+        }
+        return result;
+    }
+
+    // Get total packed reference length
+    [[nodiscard]] size_t ref_length() const noexcept {
+        size_t total = 0;
+        for (const auto& ref : refs_) total += ref.length;
+        return total;
     }
 
 private:
