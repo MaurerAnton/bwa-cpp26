@@ -497,6 +497,15 @@ public:
                 }
             }
         }
+        // Record final interval (for positions past the last exact boundary)
+        if (n % OCC_INTERVAL != 0) {
+            size_t intv = n / OCC_INTERVAL + 1;
+            if (intv < num_intv) {
+                for (int b = 0; b < 4; ++b) {
+                    idx.occ_[idx.occ_offset(b, intv)] = counts[b];
+                }
+            }
+        }
 
         // Cumulative counts
         idx.cnt_[0] = 0;
