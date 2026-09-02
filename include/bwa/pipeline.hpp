@@ -119,27 +119,28 @@ struct AlnRecord {
 
 // Reference sequence info
 struct RefSequence {
-    core::PmrString name;
-    core::PmrString md5;
+    std::string name;   // Heap-allocated, persistent
+    std::string md5;
     size_t length = 0;
     size_t offset = 0; // Offset in concatenated reference
 };
 
 // Main BWA index
+// Uses heap allocators for metadata to avoid arena lifetime issues.
+// FMIndex data is stored in arenas owned by the FMIndex objects themselves.
 class Index {
     index::MultiFMIndex fm_index_;
-    core::Vector<RefSequence> refs_;
-    core::PmrString meta_; // Serialized metadata
+    std::vector<RefSequence> refs_;  // Heap-allocated, persistent
+    std::string meta_;               // Heap-allocated, persistent
 
 public:
     Index() = default;
 
     // Build from FASTA files
     static Index build(const char* fasta_path,
-                       const Config& cfg = Config::default_mem(),
-                       memory::Arena& arena = memory::get_tls_arena()) {
+                       const Config& cfg = Config::default_mem()) {
         Index idx;
-        idx.build_impl(fasta_path, cfg, arena);
+        idx.build_impl(fasta_path, cfg);
         return idx;
     }
 
@@ -150,27 +151,25 @@ public:
         return idx;
     }
 
-    void save(const char* prefix) const {
-        save_impl(prefix);
-    }
+    void save(const char* prefix) const { save_impl(prefix); }
 
     // Accessors
     [[nodiscard]] const index::MultiFMIndex& fm_index() const noexcept { return fm_index_; }
     [[nodiscard]] index::MultiFMIndex& fm_index() noexcept { return fm_index_; }
-    [[nodiscard]] const core::Vector<RefSequence>& references() const noexcept { return refs_; }
+    [[nodiscard]] const std::vector<RefSequence>& references() const noexcept { return refs_; }
     [[nodiscard]] size_t num_references() const noexcept { return refs_.size(); }
     [[nodiscard]] size_t total_length() const noexcept { return fm_index_.total_length(); }
 
     [[nodiscard]] const RefSequence& get_ref(size_t i) const noexcept { return refs_[i]; }
     [[nodiscard]] std::optional<size_t> find_ref(std::string_view name) const noexcept {
         for (size_t i = 0; i < refs_.size(); ++i) {
-            if (refs_[i].name.view() == name) return i;
+            if (refs_[i].name == name) return i;
         }
         return std::nullopt;
     }
 
 private:
-    void build_impl(const char* fasta_path, const Config& cfg, memory::Arena& arena);
+    void build_impl(const char* fasta_path, const Config& cfg);
     void load_impl(const char* prefix);
     void save_impl(const char* prefix) const;
 };
@@ -271,8 +270,7 @@ public:
     static Pipeline build(const char* fasta_path,
                           const char* index_prefix,
                           const Config& cfg = Config::default_mem()) {
-        memory::Arena arena(1024 * 1024 * 1024); // 1GB arena
-        Index idx = Index::build(fasta_path, cfg, arena);
+        Index idx = Index::build(fasta_path, cfg);
         idx.save(index_prefix);
         return Pipeline(index_prefix, cfg);
     }

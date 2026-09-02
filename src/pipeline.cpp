@@ -144,27 +144,35 @@ void Pipeline::write_alignment(const io::SeqWriter& writer, const AlignmentResul
     // Write to output (placeholder)
 }
 
-void Index::build_impl(const char* fasta_path, const Config& cfg, memory::Arena& arena) {
+void Index::build_impl(const char* fasta_path, const Config& cfg) {
+    std::cerr << "[DEBUG] build_impl start\n";
     io::SeqReader reader(fasta_path);
     if (!reader.is_open()) {
         throw std::runtime_error("Failed to open FASTA file");
     }
+    std::cerr << "[DEBUG] reader opened\n";
 
     io::SeqRecord rec;
     size_t total_len = 0;
 
     auto read_result = reader.read(rec);
+    std::cerr << "[DEBUG] before first read\n";
     while (read_result && *read_result) {
+        std::cerr << "[DEBUG] after read, seq_len=" << rec.seq.size() << "\n";
         if (rec.is_fasta() && !rec.seq.empty()) {
+            std::cerr << "[DEBUG] processing fasta record\n";
             RefSequence ref;
-            ref.name = std::move(rec.name);
+            ref.name = std::string(rec.name.view());
             ref.length = rec.seq.size();
             ref.offset = total_len;
 
             // Pack sequence
             index::PackedSequence seq;
             seq.append(rec.seq.data(), rec.seq.size());
-            fm_index_.add_sequence(seq, arena);
+
+            std::cerr << "[DEBUG] before add_sequence\n";
+            fm_index_.add_sequence(seq, memory::get_tls_arena());
+            std::cerr << "[DEBUG] after add_sequence\n";
 
             refs_.push_back(std::move(ref));
             total_len += rec.seq.size();
@@ -172,30 +180,14 @@ void Index::build_impl(const char* fasta_path, const Config& cfg, memory::Arena&
         rec.clear();
         read_result = reader.read(rec);
     }
-
-    // Build metadata string for saving
-    core::PmrString meta;
-    meta.kputs("BWA-CPP26_INDEX\n");
-    meta.kputl(static_cast<int64_t>(refs_.size()));
-    meta.kputc('\n');
-    meta.kputl(static_cast<int64_t>(total_len));
-    meta.kputc('\n');
-    for (const auto& ref : refs_) {
-        meta.kputsn(ref.name.data(), ref.name.size());
-        meta.kputc('\t');
-        meta.kputl(static_cast<int64_t>(ref.length));
-        meta.kputc('\t');
-        meta.kputl(static_cast<int64_t>(ref.offset));
-        meta.kputc('\n');
-    }
-    meta_ = std::move(meta);
+    std::cerr << "[DEBUG] build_impl done\n";
 }
 
 void Index::save_impl(const char* prefix) const {
     // Save metadata
     std::string meta_path = std::string(prefix) + ".meta";
     std::ofstream meta_out(meta_path, std::ios::binary);
-    if (meta_) {
+    if (!meta_.empty()) {
         meta_out.write(meta_.data(), static_cast<std::streamsize>(meta_.size()));
     }
     meta_out.close();
@@ -230,10 +222,8 @@ void Index::save_impl(const char* prefix) const {
 
 void Index::load_impl(const char* prefix) {
     // Load metadata
-    core::PmrString meta_path;
-    meta_path.kputs(prefix);
-    meta_path.kputs(".meta");
-    std::ifstream meta_in(meta_path.data(), std::ios::binary);
+    std::string meta_path = std::string(prefix) + ".meta";
+    std::ifstream meta_in(meta_path, std::ios::binary);
     if (!meta_in) throw std::runtime_error("Cannot open index metadata");
 
     meta_in.seekg(0, std::ios::end);
@@ -244,7 +234,7 @@ void Index::load_impl(const char* prefix) {
     meta_in.close();
 
     // Parse metadata (simplified)
-    std::string_view mv = meta_.view();
+    std::string_view mv = meta_;
     // Skip header
     size_t pos = mv.find('\n') + 1;
     size_t num_refs = 0, total_len = 0;
@@ -255,7 +245,7 @@ void Index::load_impl(const char* prefix) {
         RefSequence ref;
         pos = mv.find('\n', pos) + 1;
         size_t end = mv.find('\t', pos);
-        ref.name.assign(mv.substr(pos, end - pos));
+        ref.name = std::string(mv.substr(pos, end - pos));
         pos = end + 1;
         end = mv.find('\t', pos);
         ref.length = std::stoull(std::string(mv.substr(pos, end - pos)));
@@ -267,10 +257,8 @@ void Index::load_impl(const char* prefix) {
     }
 
     // Load BWT
-    core::PmrString bwt_path;
-    bwt_path.kputs(prefix);
-    bwt_path.kputs(".bwt");
-    std::ifstream bwt_in(bwt_path.data(), std::ios::binary);
+    std::string bwt_path = std::string(prefix) + ".bwt";
+    std::ifstream bwt_in(bwt_path, std::ios::binary);
     // ... load each FM-index BWT
     bwt_in.close();
 

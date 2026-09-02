@@ -34,8 +34,8 @@ public:
     static constexpr char DECODE_TABLE[5] = {'A', 'C', 'G', 'T', 'N'};
 
 private:
-    core::Vector<word_type> data_;
-    core::Vector<word_type> n_mask_; // 1 bit per base: 1 = N
+    std::vector<word_type> data_;
+    std::vector<word_type> n_mask_; // 1 bit per base: 1 = N
     size_t length_ = 0;
 
     [[nodiscard]] static size_t word_index(size_t pos) noexcept { return pos / BASES_PER_WORD; }
@@ -154,9 +154,9 @@ public:
     [[nodiscard]] const_iterator end() const noexcept { return const_iterator(this, length_); }
 
     // Span access to raw words
-    [[nodiscard]] std::span<const word_type> words() const noexcept { return data_.span(); }
-    [[nodiscard]] std::span<word_type> words() noexcept { return data_.span(); }
-    [[nodiscard]] std::span<const word_type> n_masks() const noexcept { return n_mask_.span(); }
+    [[nodiscard]] std::span<const word_type> words() const noexcept { return {data_.data(), data_.size()}; }
+    [[nodiscard]] std::span<word_type> words() noexcept { return {data_.data(), data_.size()}; }
+    [[nodiscard]] std::span<const word_type> n_masks() const noexcept { return {n_mask_.data(), n_mask_.size()}; }
 
     // Get sequence as packed bytes (2 bits per base)
     [[nodiscard]] std::span<const uint8_t> bases() const noexcept {
@@ -308,9 +308,9 @@ public:
 
 private:
     PackedSequence bwt_;
-    core::Vector<occ_t> occ_;       // Rank table: occ[base][i] = count of base in bwt[0..i*OCC_INTERVAL)
-    core::Vector<uint32_t> sa_;     // Sampled SA: sa[i] = SA[i * SA_INTERVAL]
-    core::Vector<uint32_t> cnt_;    // Cumulative counts: cnt[c] = #bases < c
+    std::vector<occ_t> occ_;       // Rank table: occ[base][i] = count of base in bwt[0..i*OCC_INTERVAL)
+    std::vector<uint32_t> sa_;     // Sampled SA: sa[i] = SA[i * SA_INTERVAL]
+    std::vector<uint32_t> cnt_;    // Cumulative counts: cnt[c] = #bases < c
     size_t primary_ = 0;      // Position of original string end ($)
     size_t length_ = 0;       // Original sequence length
 
@@ -333,17 +333,17 @@ public:
     [[nodiscard]] size_t primary() const noexcept { return primary_; }
 
     // Serialization accessors
-    [[nodiscard]] const core::Vector<uint32_t>& sa_samples() const noexcept { return sa_; }
-    [[nodiscard]] const core::Vector<uint32_t>& occ_table() const noexcept { return occ_; }
-    [[nodiscard]] const core::Vector<uint32_t>& count_table() const noexcept { return cnt_; }
+    [[nodiscard]] const std::vector<uint32_t>& sa_samples() const noexcept { return sa_; }
+    [[nodiscard]] const std::vector<uint32_t>& occ_table() const noexcept { return occ_; }
+    [[nodiscard]] const std::vector<uint32_t>& count_table() const noexcept { return cnt_; }
 
     // Setter for deserialization
     void set_size(size_t s) { length_ = s; }
     void set_bwt(const PackedSequence& bwt) { bwt_ = bwt; }
     void set_primary(size_t p) { primary_ = p; }
-    void set_sa_samples(const core::Vector<uint32_t>& sa) { sa_ = sa; }
-    void set_occ_table(const core::Vector<uint32_t>& occ) { occ_ = occ; }
-    void set_count_table(const core::Vector<uint32_t>& cnt) { cnt_ = cnt; }
+    void set_sa_samples(const std::vector<uint32_t>& sa) { sa_ = sa; }
+    void set_occ_table(const std::vector<uint32_t>& occ) { occ_ = occ; }
+    void set_count_table(const std::vector<uint32_t>& cnt) { cnt_ = cnt; }
 
     // Rank: number of occurrences of base in bwt[0..pos)
     [[nodiscard]] uint32_t rank(uint8_t base, size_t pos) const noexcept {
@@ -457,11 +457,11 @@ public:
         size_t n = seq.size();
 
         // SA-IS: O(n) linear-time suffix array construction
-        core::Vector<uint32_t> sa = build_suffix_array_sais(seq, arena);
+        core::Vector<uint32_t> sa_core = build_suffix_array_sais(seq, arena);
 
         // Build BWT from SA
         for (size_t i = 0; i < n; ++i) {
-            size_t sa_i = sa[i];
+            size_t sa_i = sa_core[i];
             uint8_t b = (sa_i == 0) ? PackedSequence::ENCODE_N : seq.get(sa_i - 1);
             idx.bwt_.set(i, b);
             if (sa_i == 0) idx.primary_ = i;
@@ -495,7 +495,7 @@ public:
         // Sample SA
         idx.sa_.resize((n + SA_INTERVAL - 1) / SA_INTERVAL);
         for (size_t i = 0; i < n; i += SA_INTERVAL) {
-            idx.sa_[i / SA_INTERVAL] = sa[i];
+            idx.sa_[i / SA_INTERVAL] = sa_core[i];
         }
 
         return idx;
@@ -555,8 +555,8 @@ private:
 
 // Multi-sequence FM-index (for multiple references)
 class MultiFMIndex {
-    core::Vector<FMIndex> indexes_;
-    core::Vector<size_t> offsets_; // Cumulative lengths
+    std::vector<FMIndex> indexes_;
+    std::vector<size_t> offsets_; // Cumulative lengths
 
 public:
     void add_sequence(const PackedSequence& seq, memory::Arena& arena) {

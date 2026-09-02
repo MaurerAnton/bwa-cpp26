@@ -201,9 +201,8 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Building index from " << argv[2] << " to " << argv[3] << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
-        memory::Arena arena(1024 * 1024 * 1024); // 1GB
         Config cfg = Config::default_mem();
-        Index idx = Index::build(argv[2], cfg, arena);
+        Index idx = Index::build(argv[2], cfg);
         idx.save(argv[3]);
         auto end = std::chrono::high_resolution_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
