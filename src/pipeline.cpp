@@ -84,6 +84,11 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     auto mems = mem_finder_.find(query.bases(), arena);
     mem_finder_.filter_overlaps(mems);
 
+    // Rescue scan if no MEMs found
+    if (mems.empty()) {
+        mem_finder_.rescue_scan(query.bases(), mems, true);
+    }
+
     if (mems.empty()) {
         result.mapped = false;
         return;
