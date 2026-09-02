@@ -38,6 +38,169 @@ inline constexpr uint32_t encode_cigar(int len, CigarOp op) noexcept {
 } // namespace detail
 
 // Banded Smith-Waterman with affine gaps and full traceback
+// Semi-global: query aligned end-to-end, reference can have overhangs
+Alignment sw_semi_global_extend(const Scoring& sc,
+                                std::span<const uint8_t> query,
+                                std::span<const uint8_t> ref,
+                                int32_t band_width) {
+    int32_t qlen = static_cast<int32_t>(query.size());
+    int32_t rlen = static_cast<int32_t>(ref.size());
+
+    if (qlen == 0 || rlen == 0) return Alignment{};
+
+    int32_t w = std::max(band_width, std::abs(qlen - rlen) + 1);
+    int32_t bw = 2 * w + 1;
+
+    using DPState = struct { int32_t h, e, f; };
+    std::vector<DPState> dp((qlen + 1) * bw);
+    std::vector<uint8_t> trace((qlen + 1) * bw, 0);
+
+    auto idx = [&](int32_t i, int32_t j) -> int32_t {
+        return i * bw + (j - i + w);
+    };
+
+    // Initialize first row: semi-global allows free gaps in reference at start
+    for (int32_t j = 0; j <= rlen && j <= w; ++j) {
+        int32_t id = idx(0, j);
+        dp[id].h = 0; // Free gaps in reference
+        dp[id].e = 0;
+        dp[id].f = std::numeric_limits<int32_t>::min() / 2;
+    }
+
+    // Initialize first column: must align query from start (penalize gaps)
+    for (int32_t i = 1; i <= qlen && i <= w; ++i) {
+        int32_t id = idx(i, 0);
+        dp[id].h = sc.gap_open + sc.gap_ext * i;
+        dp[id].f = dp[id].h;
+        dp[id].e = std::numeric_limits<int32_t>::min() / 2;
+        trace[id] = 3; // Delete
+    }
+
+    // Fill DP matrix
+    for (int32_t i = 1; i <= qlen; ++i) {
+        int32_t j_min = std::max(1, i - w);
+        int32_t j_max = std::min(rlen, i + w);
+
+        for (int32_t j = j_min; j <= j_max; ++j) {
+            int32_t cur_idx = idx(i, j);
+
+            int32_t s = (query[i - 1] == ref[j - 1] && query[i - 1] < 4) ? sc.match : sc.mismatch;
+
+            int32_t h_diag = dp[idx(i - 1, j - 1)].h + s;
+            int32_t e = std::max(dp[idx(i, j - 1)].h + sc.gap_open + sc.gap_ext,
+                                  dp[idx(i, j - 1)].e + sc.gap_ext);
+            int32_t f = std::max(dp[idx(i - 1, j)].h + sc.gap_open + sc.gap_ext,
+                                  dp[idx(i - 1, j)].f + sc.gap_ext);
+            int32_t h = std::max({h_diag, e, f});
+
+            dp[cur_idx].h = h;
+            dp[cur_idx].e = e;
+            dp[cur_idx].f = f;
+
+            if (h == h_diag) {
+                trace[cur_idx] = 1;
+            } else if (h == e) {
+                trace[cur_idx] = 2;
+            } else {
+                trace[cur_idx] = 3;
+            }
+        }
+    }
+
+    // Find best end position: must end at i=qlen (query fully aligned)
+    // Allow any j in the last row
+    int32_t best_score = std::numeric_limits<int32_t>::min() / 2;
+    int32_t best_j = qlen;
+    for (int32_t j = std::max(1, qlen - w); j <= std::min(rlen, qlen + w); ++j) {
+        int32_t id = idx(qlen, j);
+        if (dp[id].h > best_score) {
+            best_score = dp[id].h;
+            best_j = j;
+        }
+    }
+
+    if (best_score <= 0) return Alignment{};
+
+    // Traceback
+    Alignment aln;
+    int32_t ti = qlen, tj = best_j;
+    int32_t cur_len = 0;
+    detail::CigarOp prev_cigar_op = detail::CigarOp::Match;
+
+    while (ti > 0 || tj > 0) {
+        if (ti == 0) {
+            // Remaining reference is unaligned (soft clip on query)
+            break;
+        }
+
+        int32_t cur_idx = idx(ti, tj);
+        uint8_t dir = trace[cur_idx];
+        if (dir == 0) {
+            if (ti == 0) break;
+            // No trace - query has unaligned prefix
+            break;
+        }
+
+        detail::CigarOp this_cigar_op;
+        if (dir == 1) {
+            bool is_match = (query[ti - 1] == ref[tj - 1] && query[ti - 1] < 4);
+            this_cigar_op = is_match ? detail::CigarOp::Equal : detail::CigarOp::Diff;
+        } else if (dir == 2) {
+            this_cigar_op = detail::CigarOp::Ins;
+        } else {
+            this_cigar_op = detail::CigarOp::Del;
+        }
+
+        if (this_cigar_op == prev_cigar_op && cur_len < 0xFFF) {
+            ++cur_len;
+        } else {
+            if (cur_len > 0) {
+                aln.cigar.push_back(detail::encode_cigar(cur_len, prev_cigar_op));
+            }
+            prev_cigar_op = this_cigar_op;
+            cur_len = 1;
+        }
+
+        if (dir == 1) { --ti; --tj; }
+        else if (dir == 2) { --tj; }
+        else { --ti; }
+    }
+
+    if (cur_len > 0) {
+        aln.cigar.push_back(detail::encode_cigar(cur_len, prev_cigar_op));
+    }
+
+    // Add soft clip for unaligned query prefix
+    if (ti > 0) {
+        aln.cigar.push_back(detail::encode_cigar(ti, detail::CigarOp::SoftClip));
+    }
+
+    // Reverse CIGAR
+    std::reverse(aln.cigar.begin(), aln.cigar.end());
+
+    aln.score = best_score;
+    aln.query_begin = 0;
+    aln.query_end = qlen;
+    aln.ref_begin = best_j - qlen;
+    aln.ref_end = best_j;
+
+    // Count mismatches
+    aln.n_mismatch = aln.n_gap_open = aln.n_gap_ext = 0;
+    for (uint32_t c : aln.cigar) {
+        auto op = static_cast<detail::CigarOp>(c & 0xF);
+        int len = c >> 4;
+        if (op == detail::CigarOp::Ins || op == detail::CigarOp::Del) {
+            aln.n_gap_open++;
+            aln.n_gap_ext += len - 1;
+        } else if (op == detail::CigarOp::Diff) {
+            aln.n_mismatch += len;
+        }
+    }
+
+    return aln;
+}
+
+// Banded Smith-Waterman with affine gaps and full traceback
 Alignment sw_extend(const Scoring& sc,
                     std::span<const uint8_t> query,
                     std::span<const uint8_t> ref,

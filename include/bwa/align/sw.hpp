@@ -126,6 +126,13 @@ Alignment sw_extend(const Scoring& sc,
                     int32_t band_width = 32,
                     int32_t max_score_drop = 100);
 
+// Semi-global Smith-Waterman: query aligned end-to-end, reference can have overhangs
+// Used for seed extension where we know the read should be fully aligned
+Alignment sw_semi_global_extend(const Scoring& sc,
+                                std::span<const uint8_t> query,
+                                std::span<const uint8_t> ref,
+                                int32_t band_width = 32);
+
 // Global alignment (Needleman-Wunsch with affine gaps)
 Alignment sw_global(const Scoring& sc,
                     std::span<const uint8_t> query,

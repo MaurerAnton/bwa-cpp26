@@ -166,12 +166,12 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         query_bytes[i] = qbases[i];
     }
 
-    // Run banded SW extension
-    align::Alignment sw_aln = align::sw_extend(
+    // Run semi-global SW extension (query aligned end-to-end)
+    align::Alignment sw_aln = align::sw_semi_global_extend(
         config_.scoring,
         std::span<const uint8_t>(query_bytes.data(), query_len),
         std::span<const uint8_t>(ref_region.data(), ref_region.size()),
-        0, 0, config_.band_width, config_.max_score_drop
+        config_.band_width
     );
 
     // Calculate final alignment position
