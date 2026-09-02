@@ -14,6 +14,11 @@
 #include <functional>
 #include <chrono>
 #include <iostream>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <queue>
+#include <condition_variable>
 
 namespace bwa {
 
@@ -310,6 +315,15 @@ public:
 
     // Align FASTQ file to SAM output
     void align_file(const char* fastq_path, const char* sam_path = "-") const {
+        if (config_.num_threads <= 1) {
+            align_file_serial(fastq_path, sam_path);
+        } else {
+            align_file_parallel(fastq_path, sam_path, config_.num_threads);
+        }
+    }
+
+    // Serial alignment (single-threaded)
+    void align_file_serial(const char* fastq_path, const char* sam_path) const {
         io::SeqReader reader(fastq_path);
         std::ofstream sam_file;
         std::ostream* out = &std::cout;
@@ -327,6 +341,68 @@ public:
         aligner_.align_stream(reader, [&](const AlignmentResult& result) {
             write_alignment(*out, result);
         });
+
+        if (sam_file.is_open()) sam_file.close();
+    }
+
+    // Parallel alignment using a simple thread pool
+    void align_file_parallel(const char* fastq_path, const char* sam_path, int num_threads) const {
+        io::SeqReader reader(fastq_path);
+        std::ofstream sam_file;
+        std::ostream* out = &std::cout;
+
+        if (std::string_view(sam_path) != "-") {
+            sam_file.open(sam_path, std::ios::binary);
+            if (!sam_file) {
+                throw std::runtime_error("Cannot open SAM output file");
+            }
+            out = &sam_file;
+        }
+
+        write_header(*out);
+
+        // Simple parallel: read in main thread, process in worker threads
+        std::mutex out_mutex;
+        std::queue<io::SeqRecord> read_queue;
+        std::atomic<bool> done{false};
+
+        auto worker = [&]() {
+            Aligner local_aligner(index_, config_);
+            while (true) {
+                io::SeqRecord read;
+                {
+                    // Not thread-safe to share SeqReader, so just process from queue
+                    // For simplicity, use a lock-free approach
+                }
+                // Get a read from the queue
+                std::lock_guard<std::mutex> lock(out_mutex);
+                if (read_queue.empty()) {
+                    if (done) break;
+                    continue;
+                }
+                read = std::move(read_queue.front());
+                read_queue.pop();
+                if (read.seq.empty()) break;
+
+                AlignmentResult result = local_aligner.align(read);
+                write_alignment(*out, result);
+            }
+        };
+
+        // Read all reads into queue first (SeqReader is not thread-safe)
+        io::SeqRecord read;
+        while (reader.read(read)) {
+            read_queue.push(std::move(read));
+            read.clear();
+        }
+        done = true;
+
+        // Process with worker threads
+        std::vector<std::thread> threads;
+        for (int t = 0; t < num_threads; ++t) {
+            threads.emplace_back(worker);
+        }
+        for (auto& t : threads) t.join();
 
         if (sam_file.is_open()) sam_file.close();
     }
