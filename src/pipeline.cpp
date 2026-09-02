@@ -193,6 +193,95 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
 
     // Copy CIGAR from SW alignment
     result.primary.cigar = sw_aln.cigar;
+
+    // Add SAM tags: NM (edit distance) and MD (mismatch string)
+    // NM tag: number of mismatches and gaps
+    int32_t nm = 0;
+    for (uint32_t c : result.primary.cigar) {
+        auto op = static_cast<align::CigarOp>(c & 0xF);
+        int len = align::cigar_len(c);
+        if (op == align::CigarOp::Diff) {
+            nm += len;
+        } else if (op == align::CigarOp::Ins || op == align::CigarOp::Del) {
+            nm += len;
+        }
+    }
+    result.primary.tags.push_back({"NM", std::to_string(nm)});
+
+    // MD tag: mismatch string
+    // Format: [0-based start] run_length [mismatch_base] ...
+    std::string md;
+    int32_t ref_pos_in_aln = final_ref_begin;
+    int32_t run_len = 0;
+    bool first = true;
+
+    for (uint32_t c : result.primary.cigar) {
+        auto op = static_cast<align::CigarOp>(c & 0xF);
+        int len = align::cigar_len(c);
+
+        if (op == align::CigarOp::Equal) {
+            run_len += len;
+            ref_pos_in_aln += len;
+        } else if (op == align::CigarOp::Diff) {
+            // Emit run length
+            if (first) {
+                md += std::to_string(ref_pos_in_aln);
+                first = false;
+            } else {
+                md += std::to_string(run_len);
+            }
+            run_len = 0;
+            // Emit mismatches
+            for (int k = 0; k < len; ++k) {
+                if (k > 0) md += "0";
+                // Get reference base at this position
+                if (ref_pos_in_aln < ref_len) {
+                    auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
+                    if (!ref_base.empty()) {
+                        md += index::PackedSequence::decode_base(ref_base[0]);
+                    } else {
+                        md += 'N';
+                    }
+                } else {
+                    md += 'N';
+                }
+                ref_pos_in_aln++;
+            }
+        } else if (op == align::CigarOp::Ins) {
+            // Insertion: doesn't consume reference, just add ^? for run
+            run_len += 0; // No change to run
+        } else if (op == align::CigarOp::Del) {
+            // Deletion: emit ^ followed by deleted bases
+            if (first) {
+                md += std::to_string(ref_pos_in_aln);
+                first = false;
+            } else {
+                md += std::to_string(run_len);
+            }
+            run_len = 0;
+            md += '^';
+            for (int k = 0; k < len; ++k) {
+                if (ref_pos_in_aln < ref_len) {
+                    auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
+                    if (!ref_base.empty()) {
+                        md += index::PackedSequence::decode_base(ref_base[0]);
+                    } else {
+                        md += 'N';
+                    }
+                } else {
+                    md += 'N';
+                }
+                ref_pos_in_aln++;
+            }
+        }
+    }
+    // Emit final run length
+    if (first) {
+        md = std::to_string(ref_pos_in_aln - final_ref_begin);
+    } else {
+        md += std::to_string(run_len);
+    }
+    result.primary.tags.push_back({"MD", md});
 }
 
 void Aligner::align_pair_impl(const io::SeqRecord& read1,
@@ -273,7 +362,13 @@ void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result)
         << result.primary.pnext << '\t'
         << result.primary.tlen << '\t';
     out << result.primary.seq << '\t';
-    out << result.primary.qual << '\n';
+    out << result.primary.qual;
+
+    // Optional tags
+    for (const auto& tag : result.primary.tags) {
+        out << '\t' << tag.first << ':' << tag.second;
+    }
+    out << '\n';
 }
 
 void Index::build_impl(const char* fasta_path, const Config& cfg) {
