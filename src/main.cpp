@@ -313,9 +313,10 @@ int main(int argc, char* argv[]) {
         //   argc==5: mem <index> <fastq1> <fastq2>  → paired-end, stdout
         //   argc==5: mem <index> <fastq> <sam_out>  → single-end to file
         //   argc==6: mem <index> <fastq1> <fastq2> <sam_out> → paired-end to file
-        // Heuristic: if the 4th arg ends in .sam or .bam, treat as sam_out
         bool has_fastq2 = false;
         if (argc == 5) {
+            // Ambiguous: could be fastq1+fastq2 or fastq+sam_out
+            // Treat as paired-end if 4th arg looks like a fastq file (exists and doesn't end in .sam/.bam)
             std::string_view arg4 = argv[4];
             bool looks_like_sam = (arg4.size() >= 4 &&
                                    (arg4.substr(arg4.size()-4) == ".sam" ||
@@ -327,6 +328,9 @@ int main(int argc, char* argv[]) {
                 }
                 test.close();
             }
+        } else if (argc >= 6) {
+            // argc==6+: definitely paired-end
+            has_fastq2 = true;
         }
 
         const char* sam_out = "-";

@@ -287,13 +287,64 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
 void Aligner::align_pair_impl(const io::SeqRecord& read1,
                               const io::SeqRecord& read2,
                               AlignmentResult& result) const {
-    // Align first read
-    align_impl(read1, result);
-
-    // For paired-end, we would also align read2 and check insert size
-    // For now, this is a stub
-    AlignmentResult result2;
+    // Align both reads independently
+    AlignmentResult result1, result2;
+    align_impl(read1, result1);
     align_impl(read2, result2);
+
+    // Use the better alignment as primary
+    AlnRecord* primary;
+    AlnRecord* mate;
+
+    if (result1.best_score >= result2.best_score) {
+        result = std::move(result1);
+        primary = &result.primary;
+        if (result2.mapped) {
+            result.secondary.push_back(std::move(result2.primary));
+            mate = &result.secondary.back();
+        } else {
+            mate = nullptr;
+        }
+    } else {
+        result = std::move(result2);
+        primary = &result.primary;
+        if (result1.mapped) {
+            result.secondary.push_back(std::move(result1.primary));
+            mate = &result.secondary.back();
+        } else {
+            mate = nullptr;
+        }
+    }
+
+    // Set paired-end FLAG bits and mate information
+    if (result.mapped && mate) {
+        // Set paired flags
+        primary->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ1;
+        mate->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ2;
+
+        // Set mate reference and position
+        primary->rnext = mate->rname;
+        primary->pnext = mate->pos;
+        mate->rnext = primary->rname;
+        mate->pnext = primary->pos;
+
+        // Check for proper pair
+        if (primary->rname == mate->rname) {
+            // Both mapped to same reference
+            // Check orientation: FR (forward-reverse) is the typical case
+            // For now, always mark as proper pair if on same reference
+            primary->flag |= AlnRecord::F_PROPER_PAIR;
+            mate->flag |= AlnRecord::F_PROPER_PAIR;
+
+            // Calculate template length (approximate)
+            int32_t tlen = mate->pos - primary->pos + 20; // +20 for read length
+            primary->tlen = tlen;
+            mate->tlen = -tlen;
+        }
+    } else if (result.mapped) {
+        // Mate didn't map
+        primary->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ1 | AlnRecord::F_MUNMAP;
+    }
 }
 
 void Aligner::chain_to_alignment(const align::MEMFinder::Chain& chain,
@@ -349,23 +400,37 @@ void Pipeline::write_header(std::ostream& out) const {
 }
 
 void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result) const {
-    if (!result.mapped) return;
+    if (!result.mapped) {
+        // Write unmapped record if it has a name
+        return;
+    }
 
-    // Build SAM line
-    out << result.primary.qname << '\t';
-    out << result.primary.flag << '\t';
-    out << result.primary.rname << '\t';
-    out << result.primary.pos << '\t';
-    out << static_cast<int>(result.primary.mapq) << '\t';
-    out << format_cigar(result.primary.cigar) << '\t';
-    out << result.primary.rnext << '\t'
-        << result.primary.pnext << '\t'
-        << result.primary.tlen << '\t';
-    out << result.primary.seq << '\t';
-    out << result.primary.qual;
+    // Write primary alignment
+    write_sam_record(out, result.primary);
+
+    // Write secondary alignments (mate for paired-end)
+    for (const auto& sec : result.secondary) {
+        if (!sec.cigar.empty()) {
+            write_sam_record(out, sec);
+        }
+    }
+}
+
+void Pipeline::write_sam_record(std::ostream& out, const AlnRecord& aln) const {
+    out << aln.qname << '\t';
+    out << aln.flag << '\t';
+    out << aln.rname << '\t';
+    out << aln.pos << '\t';
+    out << static_cast<int>(aln.mapq) << '\t';
+    out << format_cigar(aln.cigar) << '\t';
+    out << aln.rnext << '\t'
+        << aln.pnext << '\t'
+        << aln.tlen << '\t';
+    out << aln.seq << '\t';
+    out << aln.qual;
 
     // Optional tags
-    for (const auto& tag : result.primary.tags) {
+    for (const auto& tag : aln.tags) {
         out << '\t' << tag.first << ':' << tag.second;
     }
     out << '\n';

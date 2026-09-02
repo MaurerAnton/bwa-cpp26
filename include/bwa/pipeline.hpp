@@ -13,6 +13,7 @@
 #include <optional>
 #include <functional>
 #include <chrono>
+#include <iostream>
 
 namespace bwa {
 
@@ -310,49 +311,56 @@ public:
     // Align FASTQ file to SAM output
     void align_file(const char* fastq_path, const char* sam_path = "-") const {
         io::SeqReader reader(fastq_path);
-        std::ofstream sam_out;
+        std::ofstream sam_file;
+        std::ostream* out = &std::cout;
+
         if (std::string_view(sam_path) != "-") {
-            sam_out.open(sam_path, std::ios::binary);
-            if (!sam_out) {
+            sam_file.open(sam_path, std::ios::binary);
+            if (!sam_file) {
                 throw std::runtime_error("Cannot open SAM output file");
             }
+            out = &sam_file;
         }
 
-        write_header(sam_out);
+        write_header(*out);
 
         aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-            write_alignment(sam_out, result);
+            write_alignment(*out, result);
         });
 
-        if (sam_out.is_open()) sam_out.close();
+        if (sam_file.is_open()) sam_file.close();
     }
 
     // Align paired FASTQ files
     void align_pair(const char* fastq1, const char* fastq2, const char* sam_path = "-") const {
         io::SeqReader r1(fastq1), r2(fastq2);
-        std::ofstream sam_out;
+        std::ofstream sam_file;
+        std::ostream* out = &std::cout;
+
         if (std::string_view(sam_path) != "-") {
-            sam_out.open(sam_path, std::ios::binary);
-            if (!sam_out) {
+            sam_file.open(sam_path, std::ios::binary);
+            if (!sam_file) {
                 throw std::runtime_error("Cannot open SAM output file");
             }
+            out = &sam_file;
         }
 
-        write_header(sam_out);
+        write_header(*out);
 
         io::SeqRecord read1, read2;
         while (r1.read(read1) && r2.read(read2)) {
             AlignmentResult result = aligner_.align_pair(read1, read2);
-            write_alignment(sam_out, result);
+            write_alignment(*out, result);
             memory::reset_tls_arena();
         }
 
-        if (sam_out.is_open()) sam_out.close();
+        if (sam_file.is_open()) sam_file.close();
     }
 
 private:
     void write_header(std::ostream& out) const;
     void write_alignment(std::ostream& out, const AlignmentResult& result) const;
+    void write_sam_record(std::ostream& out, const AlnRecord& aln) const;
 };
 
 } // namespace bwa
