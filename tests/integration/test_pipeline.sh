@@ -50,14 +50,19 @@ echo "PASS: All index files created"
 
 # Align reads
 echo "=== Aligning reads ==="
-$BWA_CPP26 mem $TEST_DIR/test_idx $TEST_DIR/reads.fq > $TEST_DIR/aln.sam 2>&1 || true
+# Run alignment with SAM output to a file (4th arg)
+$BWA_CPP26 mem $TEST_DIR/test_idx $TEST_DIR/reads.fq - $TEST_DIR/aln.sam 2>$TEST_DIR/stderr.txt || true
 
-if [ -f $TEST_DIR/aln.sam ] && [ -s $TEST_DIR/aln.sam ]; then
+if [ -s $TEST_DIR/aln.sam ]; then
     echo "PASS: SAM output generated"
     echo "Sample output:"
-    head -3 $TEST_DIR/aln.sam
+    cat $TEST_DIR/aln.sam | head -10
 else
     echo "INFO: SAM output not generated (alignment pipeline not fully implemented yet)"
+    if [ -f $TEST_DIR/stderr.txt ]; then
+        echo "stderr:"
+        cat $TEST_DIR/stderr.txt
+    fi
 fi
 
 # Cleanup
