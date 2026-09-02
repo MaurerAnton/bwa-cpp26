@@ -110,26 +110,52 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     int32_t ref_len = static_cast<int32_t>(ref_seq.length);
     int32_t query_len = static_cast<int32_t>(read.seq.size());
 
-    // Get reference position from the first MEM
-    int32_t ref_pos = best_chain.mems[0].ref_pos;
-    int32_t chain_query_begin = best_chain.mems.front().query_pos;
-    int32_t chain_ref_begin = best_chain.mems.front().ref_pos;
-
-    // Calculate alignment region with padding
-    int32_t padding = config_.band_width * 2;
-    int32_t ref_begin = std::max<int32_t>(0, chain_ref_begin - padding);
-    int32_t ref_end = std::min<int32_t>(ref_len, chain_ref_begin + query_len + padding);
-
-    if (ref_end <= ref_begin) {
-        result.mapped = false;
-        return;
+    // Pack query for SW
+    std::vector<uint8_t> query_bytes(query_len);
+    auto qbases = query.bases();
+    for (int32_t i = 0; i < query_len; ++i) {
+        query_bytes[i] = qbases[i];
     }
 
-    // Extract reference region
-    auto ref_region = index_.extract_ref(ref_begin, ref_end);
-    if (ref_region.empty()) {
-        // No packed reference available - fall back to simple CIGAR from chain
+    // Process up to max_secondary alignments (best chain + secondary chains)
+    int max_alignments = std::min<int>(chains.size(), 1 + config_.max_occ / 100);
+    if (max_alignments < 1) max_alignments = 1;
+    if (max_alignments > 4) max_alignments = 4; // Cap at 4 total alignments
+
+    align::Alignment best_swaln;
+    int32_t best_chain_idx = -1;
+    std::vector<std::pair<int32_t, align::Alignment>> all_alignments;
+
+    for (int32_t ci = 0; ci < max_alignments && ci < (int32_t)chains.size(); ++ci) {
+        const auto& chain = chains[ci];
+        int32_t chain_ref_begin = chain.mems.front().ref_pos;
+
+        int32_t padding = config_.band_width * 2;
+        int32_t ref_begin = std::max<int32_t>(0, chain_ref_begin - padding);
+        int32_t ref_end = std::min<int32_t>(ref_len, chain_ref_begin + query_len + padding);
+
+        if (ref_end <= ref_begin) continue;
+
+        auto ref_region = index_.extract_ref(ref_begin, ref_end);
+        if (ref_region.empty()) continue;
+
+        align::Alignment sw_aln = align::sw_semi_global_extend(
+            config_.scoring,
+            std::span<const uint8_t>(query_bytes.data(), query_len),
+            std::span<const uint8_t>(ref_region.data(), ref_region.size()),
+            config_.band_width
+        );
+
+        if (sw_aln.score > 0) {
+            all_alignments.push_back({ci, std::move(sw_aln)});
+        }
+    }
+
+    if (all_alignments.empty()) {
+        // Fall back to simple CIGAR from best chain
+        int32_t ref_pos = best_chain.mems[0].ref_pos;
         result.mapped = true;
+        result.best_score = best_chain.score;
         result.best_score = best_chain.score;
         result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
         result.primary.qname = std::string(read.name.view());
@@ -143,145 +169,117 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         int32_t prev_query_end = 0;
         for (const auto& mem : best_chain.mems) {
             if (mem.query_pos > prev_query_end) {
-                int32_t clip_len = mem.query_pos - prev_query_end;
                 result.primary.cigar.push_back(
-                    align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+                    align::encode_cigar(mem.query_pos - prev_query_end, align::CigarOp::SoftClip));
             }
             result.primary.cigar.push_back(
                 align::encode_cigar(mem.len, align::CigarOp::Match));
             prev_query_end = mem.query_end();
         }
         if (prev_query_end < query_len) {
-            int32_t clip_len = query_len - prev_query_end;
             result.primary.cigar.push_back(
-                align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+                align::encode_cigar(query_len - prev_query_end, align::CigarOp::SoftClip));
         }
         return;
     }
 
-    // Convert query to span for SW
-    std::vector<uint8_t> query_bytes(query_len);
-    auto qbases = query.bases();
-    for (int32_t i = 0; i < query_len; ++i) {
-        query_bytes[i] = qbases[i];
-    }
+    // Sort alignments by score (descending)
+    std::sort(all_alignments.begin(), all_alignments.end(),
+              [](const auto& a, const auto& b) { return a.second.score > b.second.score; });
 
-    // Run semi-global SW extension (query aligned end-to-end)
-    align::Alignment sw_aln = align::sw_semi_global_extend(
-        config_.scoring,
-        std::span<const uint8_t>(query_bytes.data(), query_len),
-        std::span<const uint8_t>(ref_region.data(), ref_region.size()),
-        config_.band_width
-    );
+    // Use the best alignment as primary
+    const auto& [primary_chain_idx, primary_swaln] = all_alignments[0];
+    int32_t primary_ref_begin = chains[primary_chain_idx].mems.front().ref_pos;
+    int32_t padding = config_.band_width * 2;
+    int32_t primary_ref_region_begin = std::max<int32_t>(0, primary_ref_begin - padding);
+    int32_t final_ref_begin = primary_ref_region_begin + primary_swaln.ref_begin;
+    int32_t final_ref_end = primary_ref_region_begin + primary_swaln.ref_end;
 
-    // Calculate final alignment position
-    int32_t final_ref_begin = ref_begin + sw_aln.ref_begin;
-    int32_t final_ref_end = ref_begin + sw_aln.ref_end;
-
-    result.mapped = sw_aln.score > 0;
-    result.best_score = sw_aln.score;
-    result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
+    result.mapped = true;
+    result.best_score = primary_swaln.score;
+    result.second_best_score = all_alignments.size() > 1 ? all_alignments[1].second.score : 0;
 
     // Build primary alignment
     result.primary.qname = std::string(read.name.view());
     result.primary.rname = ref_seq.name;
-    result.primary.pos = final_ref_begin + 1; // SAM is 1-based
+    result.primary.pos = final_ref_begin + 1;
     result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
-    result.primary.score = sw_aln.score;
+    result.primary.score = primary_swaln.score;
     result.primary.seq = std::string(read.seq.view());
     result.primary.qual = std::string(read.qual.view());
+    result.primary.cigar = primary_swaln.cigar;
 
-    // Copy CIGAR from SW alignment
-    result.primary.cigar = sw_aln.cigar;
-
-    // Add SAM tags: NM (edit distance) and MD (mismatch string)
-    // NM tag: number of mismatches and gaps
+    // Add NM and MD tags for primary
     int32_t nm = 0;
     for (uint32_t c : result.primary.cigar) {
         auto op = static_cast<align::CigarOp>(c & 0xF);
         int len = align::cigar_len(c);
-        if (op == align::CigarOp::Diff) {
-            nm += len;
-        } else if (op == align::CigarOp::Ins || op == align::CigarOp::Del) {
-            nm += len;
-        }
+        if (op == align::CigarOp::Diff) nm += len;
+        else if (op == align::CigarOp::Ins || op == align::CigarOp::Del) nm += len;
     }
     result.primary.tags.push_back({"NM", std::to_string(nm)});
 
-    // MD tag: mismatch string
-    // Format: [0-based start] run_length [mismatch_base] ...
+    // MD tag
     std::string md;
     int32_t ref_pos_in_aln = final_ref_begin;
     int32_t run_len = 0;
     bool first = true;
-
     for (uint32_t c : result.primary.cigar) {
         auto op = static_cast<align::CigarOp>(c & 0xF);
         int len = align::cigar_len(c);
-
         if (op == align::CigarOp::Equal) {
             run_len += len;
             ref_pos_in_aln += len;
         } else if (op == align::CigarOp::Diff) {
-            // Emit run length
-            if (first) {
-                md += std::to_string(ref_pos_in_aln);
-                first = false;
-            } else {
-                md += std::to_string(run_len);
-            }
+            if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
+            else { md += std::to_string(run_len); }
             run_len = 0;
-            // Emit mismatches
             for (int k = 0; k < len; ++k) {
                 if (k > 0) md += "0";
-                // Get reference base at this position
                 if (ref_pos_in_aln < ref_len) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
-                    if (!ref_base.empty()) {
-                        md += index::PackedSequence::decode_base(ref_base[0]);
-                    } else {
-                        md += 'N';
-                    }
-                } else {
-                    md += 'N';
-                }
+                    md += !ref_base.empty() ? index::PackedSequence::decode_base(ref_base[0]) : 'N';
+                } else { md += 'N'; }
                 ref_pos_in_aln++;
             }
-        } else if (op == align::CigarOp::Ins) {
-            // Insertion: doesn't consume reference, just add ^? for run
-            run_len += 0; // No change to run
         } else if (op == align::CigarOp::Del) {
-            // Deletion: emit ^ followed by deleted bases
-            if (first) {
-                md += std::to_string(ref_pos_in_aln);
-                first = false;
-            } else {
-                md += std::to_string(run_len);
-            }
+            if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
+            else { md += std::to_string(run_len); }
             run_len = 0;
             md += '^';
             for (int k = 0; k < len; ++k) {
                 if (ref_pos_in_aln < ref_len) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
-                    if (!ref_base.empty()) {
-                        md += index::PackedSequence::decode_base(ref_base[0]);
-                    } else {
-                        md += 'N';
-                    }
-                } else {
-                    md += 'N';
-                }
+                    md += !ref_base.empty() ? index::PackedSequence::decode_base(ref_base[0]) : 'N';
+                } else { md += 'N'; }
                 ref_pos_in_aln++;
             }
         }
     }
-    // Emit final run length
-    if (first) {
-        md = std::to_string(ref_pos_in_aln - final_ref_begin);
-    } else {
-        md += std::to_string(run_len);
-    }
+    if (first) { md = std::to_string(ref_pos_in_aln - final_ref_begin); }
+    else { md += std::to_string(run_len); }
     result.primary.tags.push_back({"MD", md});
+
+    // Add secondary alignments
+    for (size_t i = 1; i < all_alignments.size() && i < 4; ++i) {
+        const auto& [sec_chain_idx, sec_swaln] = all_alignments[i];
+        int32_t sec_ref_begin = chains[sec_chain_idx].mems.front().ref_pos;
+        int32_t sec_ref_region_begin = std::max<int32_t>(0, sec_ref_begin - padding);
+        int32_t sec_final_begin = sec_ref_region_begin + sec_swaln.ref_begin;
+        int32_t sec_final_end = sec_ref_region_begin + sec_swaln.ref_end;
+
+        AlnRecord sec;
+        sec.qname = std::string(read.name.view());
+        sec.flag = AlnRecord::F_SECONDARY;
+        sec.rname = ref_seq.name;
+        sec.pos = sec_final_begin + 1;
+        sec.mapq = compute_mapq(result.best_score, sec_swaln.score);
+        sec.score = sec_swaln.score;
+        sec.seq = std::string(read.seq.view());
+        sec.qual = std::string(read.qual.view());
+        sec.cigar = sec_swaln.cigar;
+        result.secondary.push_back(std::move(sec));
+    }
 }
 
 void Aligner::align_pair_impl(const io::SeqRecord& read1,
@@ -401,18 +399,15 @@ void Pipeline::write_header(std::ostream& out) const {
 
 void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result) const {
     if (!result.mapped) {
-        // Write unmapped record if it has a name
         return;
     }
 
     // Write primary alignment
     write_sam_record(out, result.primary);
 
-    // Write secondary alignments (mate for paired-end)
+    // Write secondary alignments
     for (const auto& sec : result.secondary) {
-        if (!sec.cigar.empty()) {
-            write_sam_record(out, sec);
-        }
+        write_sam_record(out, sec);
     }
 }
 
