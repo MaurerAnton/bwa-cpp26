@@ -9,6 +9,7 @@
 #include <array>
 #include <algorithm>
 #include <limits>
+#include <vector>
 
 namespace bwa::align {
 
@@ -58,8 +59,107 @@ public:
         // Forward search
         find_strand(query, mems, true);
 
-        // Reverse complement search (if needed for bidirectional)
-        // For now, just forward
+        // Find inexact seeds (1 mismatch) for positions without exact MEMs
+        find_inexact_seeds(query, mems, true);
+
+        // Reverse complement search
+        core::Vector<uint8_t> rc_query;
+        rc_query.resize(query.size());
+        for (size_t i = 0; i < query.size(); ++i) {
+            uint8_t b = query[query.size() - 1 - i];
+            // Complement: A<->T, C<->G, N->N
+            if (b == 0) rc_query[i] = 3;      // A -> T
+            else if (b == 1) rc_query[i] = 2;  // C -> G
+            else if (b == 2) rc_query[i] = 1;  // G -> C
+            else if (b == 3) rc_query[i] = 0;  // T -> A
+            else rc_query[i] = 4;              // N -> N
+        }
+        find_strand(std::span<const uint8_t>(rc_query.data(), rc_query.size()),
+                    mems, false);
+        find_inexact_seeds(std::span<const uint8_t>(rc_query.data(), rc_query.size()),
+                           mems, false);
+    }
+
+    // Find inexact seeds (1 mismatch) for query positions
+    void find_inexact_seeds(const std::span<const uint8_t>& query,
+                            core::Vector<MEM>& mems,
+                            bool is_fwd) const {
+        int32_t qlen = static_cast<int32_t>(query.size());
+        if (qlen < min_seed_len_) return;
+
+        // For each position, check if there's already a MEM covering it
+        // If not, try 1-mismatch seeds
+        std::vector<bool> covered(qlen, false);
+        for (const auto& mem : mems) {
+            for (int32_t i = mem.query_pos; i < mem.query_end(); ++i) {
+                if (i >= 0 && i < qlen) covered[i] = true;
+            }
+        }
+
+        // Try 1-mismatch seeds at uncovered positions
+        for (int32_t i = 0; i + min_seed_len_ <= qlen; ++i) {
+            if (covered[i]) continue;
+
+            // Check if position has any N
+            bool has_n = false;
+            for (int k = 0; k < min_seed_len_; ++k) {
+                if (query[i + k] >= 4) { has_n = true; break; }
+            }
+            if (has_n) continue;
+
+            // Try exact match first
+            size_t l = 0, r = fm_index_.length();
+            for (int k = min_seed_len_ - 1; k >= 0; --k) {
+                auto [nl, nr] = fm_index_.backward_extend(query[i + k], l, r);
+                if (nl >= nr) { l = 0; r = 0; break; }
+                l = nl; r = nr;
+            }
+
+            if (r > l && r - l <= static_cast<size_t>(max_occ_)) {
+                // Exact match found
+                if (auto pos = fm_index_.locate(l)) {
+                    MEM mem;
+                    mem.query_pos = i;
+                    mem.ref_pos = *pos;
+                    mem.len = min_seed_len_;
+                    mem.score = min_seed_len_ * match_score_;
+                    mem.is_forward = is_fwd;
+                    mems.push_back(mem);
+                    covered[i] = true;
+                }
+            } else {
+                // Try 1-mismatch seeds
+                for (int mm_pos = 0; mm_pos < min_seed_len_; ++mm_pos) {
+                    for (uint8_t alt = 0; alt < 4; ++alt) {
+                        if (alt == query[i + mm_pos]) continue;
+
+                        l = 0; r = fm_index_.length();
+                        bool ok = true;
+                        for (int k = min_seed_len_ - 1; k >= 0; --k) {
+                            uint8_t base = (k == mm_pos) ? alt : query[i + k];
+                            auto [nl, nr] = fm_index_.backward_extend(base, l, r);
+                            if (nl >= nr) { ok = false; break; }
+                            l = nl; r = nr;
+                        }
+                        if (!ok) continue;
+                        if (r - l > static_cast<size_t>(max_occ_)) continue;
+
+                        if (auto pos = fm_index_.locate(l)) {
+                            MEM mem;
+                            mem.query_pos = i;
+                            mem.ref_pos = *pos;
+                            mem.len = min_seed_len_;
+                            mem.score = min_seed_len_ * match_score_;
+                            mem.is_forward = is_fwd;
+                            mems.push_back(mem);
+                            covered[i] = true;
+                            break;  // Found a match for this position
+                        }
+                    }
+                    if (covered[i]) break;
+                }
+            }
+        }
     }
 
     // Find MEMs using SMEM (simple maximal exact matches) algorithm
