@@ -280,51 +280,93 @@ public:
         int32_t ref_begin = 0, ref_end = 0;
     };
 
-    // Simple colinear chaining (greedy)
+    // DP-based optimal chaining (BWA-MEM style)
+    // Finds the highest-scoring chain of colinear MEMs
     core::Vector<Chain> chain(const core::Vector<MEM>& mems,
                         int32_t max_gap = 10000,
                         int32_t min_chain_score = 30) const {
         core::Vector<Chain> chains;
         if (mems.empty()) return chains;
 
-        Chain current;
-        current.mems.push_back(mems[0]);
-        current.score = mems[0].score;
-        current.query_begin = current.query_end = mems[0].query_end();
-        current.ref_begin = current.ref_end = mems[0].ref_end();
+        // Sort MEMs by query position
+        std::vector<MEM> sorted_mems(mems.begin(), mems.end());
+        std::sort(sorted_mems.begin(), sorted_mems.end(),
+                  [](const MEM& a, const MEM& b) {
+                      if (a.query_pos != b.query_pos) return a.query_pos < b.query_pos;
+                      return a.ref_pos < b.ref_pos;
+                  });
 
-        for (size_t i = 1; i < mems.size(); ++i) {
-            const MEM& mem = mems[i];
-            const MEM& last = current.mems.back();
+        int32_t n = static_cast<int32_t>(sorted_mems.size());
 
-            int32_t qgap = mem.query_pos - last.query_end();
-            int32_t rgap = mem.ref_pos - last.ref_end();
+        // DP: best_score[i] = best chain score ending at MEM i
+        // predecessor[i] = index of previous MEM in best chain ending at i
+        std::vector<int32_t> best_score(n);
+        std::vector<int32_t> predecessor(n, -1);
 
-            // Check colinearity and gap
-            if (qgap >= 0 && rgap >= 0 && qgap <= max_gap && rgap <= max_gap) {
-                // Add to chain
-                current.mems.push_back(mem);
-                current.score += mem.score - std::max(qgap, rgap);
-                current.query_end = mem.query_end();
-                current.ref_end = mem.ref_end();
-            } else {
-                // Start new chain
-                if (current.score >= min_chain_score) {
-                    chains.push_back(std::move(current));
+        for (int32_t i = 0; i < n; ++i) {
+            best_score[i] = sorted_mems[i].score;
+            predecessor[i] = -1;
+
+            // Find best predecessor
+            for (int32_t j = 0; j < i; ++j) {
+                const MEM& prev = sorted_mems[j];
+                const MEM& curr = sorted_mems[i];
+
+                // Check colinearity
+                int32_t qgap = curr.query_pos - prev.query_end();
+                int32_t rgap = curr.ref_pos - prev.ref_end();
+
+                if (qgap < 0 || rgap < 0) continue; // Not colinear
+                if (qgap > max_gap || rgap > max_gap) continue; // Gap too large
+
+                // Gap penalty: penalize the larger gap
+                int32_t gap_penalty = std::max(qgap, rgap);
+
+                int32_t candidate_score = best_score[j] + curr.score - gap_penalty;
+                if (candidate_score > best_score[i]) {
+                    best_score[i] = candidate_score;
+                    predecessor[i] = j;
                 }
-                current = Chain{};
-                current.mems.push_back(mem);
-                current.score = mem.score;
-                current.query_begin = current.query_end = mem.query_end();
-                current.ref_begin = current.ref_end = mem.ref_end();
             }
         }
 
-        if (current.score >= min_chain_score) {
-            chains.push_back(std::move(current));
+        // Find all chains with score >= min_chain_score
+        // Trace back from each MEM that could be a chain end
+        std::vector<bool> used(n, false);
+        std::vector<Chain> all_chains;
+
+        // Sort by best_score descending to find top chains
+        std::vector<int32_t> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+                  [&](int32_t a, int32_t b) { return best_score[a] > best_score[b]; });
+
+        for (int32_t idx : order) {
+            if (best_score[idx] < min_chain_score) break;
+            if (used[idx]) continue;
+
+            // Trace back to build this chain
+            Chain chain;
+            int32_t cur = idx;
+            while (cur >= 0) {
+                used[cur] = true;
+                chain.mems.push_back(sorted_mems[cur]);
+                cur = predecessor[cur];
+            }
+            // Reverse to get query order
+            std::reverse(chain.mems.begin(), chain.mems.end());
+
+            // Compute chain statistics
+            chain.score = best_score[idx];
+            chain.query_begin = chain.mems.front().query_pos;
+            chain.query_end = chain.mems.back().query_end();
+            chain.ref_begin = chain.mems.front().ref_pos;
+            chain.ref_end = chain.mems.back().ref_end();
+
+            all_chains.push_back(std::move(chain));
         }
 
-        return chains;
+        return all_chains;
     }
 
     // Configuration
