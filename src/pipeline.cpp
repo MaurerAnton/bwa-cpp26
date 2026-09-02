@@ -117,6 +117,15 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         query_bytes[i] = qbases[i];
     }
 
+    // Adaptive scoring based on read length (BWA-MEM style)
+    // For longer reads, increase gap penalties to avoid spurious alignments
+    align::Scoring adaptive_scoring = config_.scoring;
+    if (query_len > 100) {
+        // Scale gap penalties with read length
+        adaptive_scoring.gap_open = std::min<int>(-1, static_cast<int>(-0.01 * query_len - 4));
+        adaptive_scoring.gap_ext = std::min<int>(-1, static_cast<int>(-0.1 * query_len));
+    }
+
     // Process up to max_secondary alignments (best chain + secondary chains)
     int max_alignments = std::min<int>(chains.size(), 1 + config_.max_occ / 100);
     if (max_alignments < 1) max_alignments = 1;
@@ -140,7 +149,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         if (ref_region.empty()) continue;
 
         align::Alignment sw_aln = align::sw_semi_global_extend(
-            config_.scoring,
+            adaptive_scoring,
             std::span<const uint8_t>(query_bytes.data(), query_len),
             std::span<const uint8_t>(ref_region.data(), ref_region.size()),
             config_.band_width
