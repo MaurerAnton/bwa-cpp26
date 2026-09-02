@@ -172,7 +172,15 @@ Alignment sw_extend(const Scoring& sc,
             ++cur_len;
         } else {
             if (cur_len > 0) {
-                aln.cigar.push_back(detail::encode_cigar(cur_len, static_cast<detail::CigarOp>(prev_dir)));
+                // Map TraceDir to CigarOp: Match->Match, Insert->Ins, Delete->Del
+                detail::CigarOp cigar_op;
+                switch (prev_dir) {
+                    case 1: cigar_op = detail::CigarOp::Match; break;
+                    case 2: cigar_op = detail::CigarOp::Ins; break;
+                    case 3: cigar_op = detail::CigarOp::Del; break;
+                    default: cigar_op = detail::CigarOp::Match;
+                }
+                aln.cigar.push_back(detail::encode_cigar(cur_len, cigar_op));
                 aln.n_cigar++;
             }
             prev_dir = dir;
@@ -192,14 +200,89 @@ Alignment sw_extend(const Scoring& sc,
     }
 
     if (cur_len > 0) {
-        aln.cigar.push_back(detail::encode_cigar(cur_len, static_cast<detail::CigarOp>(prev_dir)));
+        detail::CigarOp cigar_op;
+        switch (prev_dir) {
+            case 1: cigar_op = detail::CigarOp::Match; break;
+            case 2: cigar_op = detail::CigarOp::Ins; break;
+            case 3: cigar_op = detail::CigarOp::Del; break;
+            default: cigar_op = detail::CigarOp::Match;
+        }
+        aln.cigar.push_back(detail::encode_cigar(cur_len, cigar_op));
         aln.n_cigar++;
     }
 
     // Reverse CIGAR to get correct order
     std::reverse(aln.cigar.begin(), aln.cigar.end());
 
-    // Count gaps
+    // Second pass: refine Match ops to = (match) or X (mismatch)
+    // We need to walk the alignment again to check actual bases
+    // Since CIGAR is in forward order (after reversal), but we track from end, iterate in reverse
+    int32_t q_pos = max_i - 1; // Current query position (0-based, at end of alignment)
+    int32_t r_pos = max_j - 1; // Current ref position (0-based, at end of alignment)
+    
+    // We'll build a new CIGAR with = and X split (in reverse order, then reverse at end)
+    std::vector<uint32_t> new_cigar_rev;
+    int32_t new_n_cigar = 0;
+    
+    // Iterate CIGAR in REVERSE order (from end of alignment to start)
+    for (auto it = aln.cigar.rbegin(); it != aln.cigar.rend(); ++it) {
+        uint32_t c = *it;
+        auto op = static_cast<detail::CigarOp>(c & 0xF);
+        int len = c >> 4;
+        if (op == detail::CigarOp::Match) {
+            // Split this Match run into = and X sub-runs based on actual bases
+            int sub_len = 0;
+            detail::CigarOp sub_op = detail::CigarOp::Match;
+            bool sub_op_set = false;
+            
+            for (int k = 0; k < len; ++k) {
+                // Since we're iterating CIGAR in reverse, we check bases from current position backwards
+                bool is_match = (query[query_start + q_pos] == ref[ref_start + r_pos]);
+                detail::CigarOp this_op = is_match ? detail::CigarOp::Equal : detail::CigarOp::Diff;
+                
+                if (!sub_op_set) {
+                    sub_op = (q_pos >= 0 && r_pos >= 0 && query[query_start + q_pos] == ref[ref_start + r_pos]) ? detail::CigarOp::Equal : detail::CigarOp::Diff;
+                    sub_op_set = true;
+                    sub_len = 1;
+                } else if (this_op == sub_op) {
+                    ++sub_len;
+                } else {
+                    // Op changed, emit previous sub-run
+                    new_cigar_rev.push_back(detail::encode_cigar(sub_len, sub_op));
+                    ++new_n_cigar;
+                    sub_op = this_op;
+                    sub_len = 1;
+                }
+                
+                --q_pos;
+                --r_pos;
+            }
+            
+            // Emit last sub-run
+            if (sub_op_set) {
+                new_cigar_rev.push_back(detail::encode_cigar(sub_len, sub_op));
+                ++new_n_cigar;
+            }
+            
+            q_pos -= len;
+            r_pos -= len;
+        } else if (op == detail::CigarOp::Ins) {
+            new_cigar_rev.push_back(c);
+            ++new_n_cigar;
+            q_pos -= len;
+        } else if (op == detail::CigarOp::Del) {
+            new_cigar_rev.push_back(c);
+            ++new_n_cigar;
+            r_pos -= len;
+        }
+    }
+    
+    // Reverse to get correct order
+    std::reverse(new_cigar_rev.begin(), new_cigar_rev.end());
+    aln.cigar = std::move(new_cigar_rev);
+    aln.n_cigar = new_n_cigar;
+
+    // Count gaps and mismatches
     aln.n_mismatch = aln.n_gap_open = aln.n_gap_ext = 0;
     for (uint32_t c : aln.cigar) {
         auto op = static_cast<detail::CigarOp>(c & 0xF);
@@ -210,6 +293,8 @@ Alignment sw_extend(const Scoring& sc,
         } else if (op == detail::CigarOp::Del) {
             aln.n_gap_open++;
             aln.n_gap_ext += len - 1;
+        } else if (op == detail::CigarOp::Diff) {
+            aln.n_mismatch += len;
         }
     }
 
@@ -237,24 +322,32 @@ Alignment sw_global(const Scoring& sc,
     int32_t w = band_width > 0 ? band_width : std::max(qlen, rlen);
     int32_t bw = 2 * w + 1;
 
+    // DP arrays (full 2D for traceback)
     using DPState = struct { int32_t h, e, f; };
     std::vector<DPState> dp((qlen + 1) * bw);
+    std::vector<uint8_t> trace((qlen + 1) * bw); // 0=None, 1=Match, 2=Insert, 3=Delete
+
+    auto idx = [&](int32_t i, int32_t j) -> int32_t {
+        return i * bw + (j - i + w);
+    };
 
     // Initialize
     dp[w].h = 0;
     dp[w].e = dp[w].f = std::numeric_limits<int32_t>::min() / 2;
 
     for (int32_t j = 1; j <= rlen && j <= w; ++j) {
-        int32_t idx = (j + w) % bw;
-        dp[idx].h = sc.gap_open + sc.gap_ext * j;
-        dp[idx].e = dp[idx].h;
-        dp[idx].f = std::numeric_limits<int32_t>::min() / 2;
+        int32_t init_idx = j + w;  // idx(0, j) = j + w
+        dp[init_idx].h = sc.gap_open + sc.gap_ext * j;
+        dp[init_idx].e = dp[init_idx].h;
+        dp[init_idx].f = std::numeric_limits<int32_t>::min() / 2;
+        trace[init_idx] = 2; // Insert
     }
     for (int32_t i = 1; i <= qlen && i <= w; ++i) {
-        int32_t idx = (i * bw + (-i + w)) % bw;
-        dp[idx].h = sc.gap_open + sc.gap_ext * i;
-        dp[idx].f = dp[idx].h;
-        dp[idx].e = std::numeric_limits<int32_t>::min() / 2;
+        int32_t init_idx = i * bw - i + w;  // idx(i, 0) = i*bw - i + w
+        dp[init_idx].h = sc.gap_open + sc.gap_ext * i;
+        dp[init_idx].f = dp[init_idx].h;
+        dp[init_idx].e = std::numeric_limits<int32_t>::min() / 2;
+        trace[init_idx] = 3; // Delete
     }
 
     for (int32_t i = 1; i <= qlen; ++i) {
@@ -262,28 +355,117 @@ Alignment sw_global(const Scoring& sc,
         int32_t j_max = std::min(rlen, i + w);
 
         for (int32_t j = j_min; j <= j_max; ++j) {
-            int32_t idx = (i * bw + (j - i + w)) % bw;
-            int32_t idx_diag = ((i - 1) * bw + (j - 1 - (i - 1) + w)) % bw;
-            int32_t idx_up = ((i - 1) * bw + (j - (i - 1) + w)) % bw;
-            int32_t idx_left = (i * bw + (j - 1 - i + w)) % bw;
+            int32_t cur_idx = idx(i, j);
+            int32_t idx_diag = idx(i - 1, j - 1);
+            int32_t idx_up = idx(i - 1, j);
+            int32_t idx_left = idx(i, j - 1);
 
             int32_t s = (query[i - 1] == ref[j - 1] && query[i - 1] < 4) ? sc.match : sc.mismatch;
 
             int32_t h_diag = dp[idx_diag].h + s;
-            int32_t e = std::max(dp[idx_left].h + sc.gap_open + sc.gap_ext,
-                                  dp[idx_left].e + sc.gap_ext);
+            int32_t e = std::max(dp[idx(i, j - 1)].h + sc.gap_open + sc.gap_ext,
+                                  dp[idx(i, j - 1)].e + sc.gap_ext);
             int32_t f = std::max(dp[idx_up].h + sc.gap_open + sc.gap_ext,
-                                  dp[idx_up].f + sc.gap_ext);
+                                  dp[idx(i - 1, j)].f + sc.gap_ext);
             int32_t h = std::max({h_diag, e, f});
 
-            dp[idx].h = h;
-            dp[idx].e = e;
-            dp[idx].f = f;
+            dp[idx(i, j)].h = h;
+            dp[idx(i, j)].e = e;
+            dp[idx(i, j)].f = f;
+
+            // Determine traceback direction
+            if (h == h_diag) {
+                trace[cur_idx] = 1; // Match
+            } else if (h == e) {
+                trace[cur_idx] = 2; // Insert
+            } else {
+                trace[cur_idx] = 3; // Delete
+            }
+
+            dp[cur_idx].h = h;
+            dp[cur_idx].e = e;
+            dp[cur_idx].f = f;
         }
     }
 
-    int32_t end_idx = (qlen * bw + (rlen - qlen + w)) % bw;
-    aln.score = dp[end_idx].h;
+    int32_t end_idx = qlen * bw + (rlen - qlen + w);
+    int32_t max_score = dp[end_idx].h;
+    int32_t ti = qlen, tj = rlen;
+    uint8_t prev_dir = 0; // 0=None
+    int32_t cur_len = 0;
+
+    auto idx_func = [&](int32_t ti, int32_t tj) -> int32_t {
+        return ti * bw + (tj - ti + w);
+    };
+
+    detail::CigarOp prev_cigar_op = detail::CigarOp::Match;
+
+    while (ti > 0 || tj > 0) {
+        uint8_t dir = trace[idx_func(ti, tj)];
+
+        if (dir == 0 || (ti == 0 && tj == 0)) break;
+
+        detail::CigarOp this_cigar_op;
+        if (dir == 1) { // Match
+            // Check if match or mismatch at this position
+            bool is_match = (query[ti - 1] == ref[tj - 1] && query[ti - 1] < 4);
+            this_cigar_op = is_match ? detail::CigarOp::Equal : detail::CigarOp::Diff;
+        } else if (dir == 2) { // Insert
+            this_cigar_op = detail::CigarOp::Ins;
+        } else if (dir == 3) { // Delete
+            this_cigar_op = detail::CigarOp::Del;
+        } else {
+            break;
+        }
+
+        if (this_cigar_op == prev_cigar_op && cur_len < 0xFFF) {
+            ++cur_len;
+        } else {
+            if (cur_len > 0) {
+                aln.cigar.push_back(detail::encode_cigar(cur_len, prev_cigar_op));
+                aln.n_cigar++;
+            }
+            prev_cigar_op = this_cigar_op;
+            cur_len = 1;
+        }
+
+        // Move according to traceback direction
+        if (dir == 1) { // Match
+            --ti; --tj;
+        } else if (dir == 2) { // Insert
+            --tj;
+        } else if (dir == 3) { // Delete
+            --ti;
+        } else {
+            break;
+        }
+    }
+
+    if (cur_len > 0) {
+        aln.cigar.push_back(detail::encode_cigar(cur_len, prev_cigar_op));
+        aln.n_cigar++;
+    }
+
+    // Reverse CIGAR to get correct order
+    std::reverse(aln.cigar.begin(), aln.cigar.end());
+
+    // Count gaps and mismatches
+    aln.n_mismatch = aln.n_gap_open = aln.n_gap_ext = 0;
+    for (uint32_t c : aln.cigar) {
+        auto op = static_cast<detail::CigarOp>(c & 0xF);
+        int len = c >> 4;
+        if (op == detail::CigarOp::Ins) {
+            aln.n_gap_open++;
+            aln.n_gap_ext += len - 1;
+        } else if (op == detail::CigarOp::Del) {
+            aln.n_gap_open++;
+            aln.n_gap_ext += len - 1;
+        } else if (op == detail::CigarOp::Diff) {
+            aln.n_mismatch += len;
+        }
+    }
+
+    aln.score = max_score;
     aln.ref_begin = 0;
     aln.ref_end = rlen;
     aln.query_begin = 0;

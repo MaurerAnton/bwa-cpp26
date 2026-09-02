@@ -167,26 +167,47 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Test FASTA reading
+        // Test CIGAR =/X refinement
         {
-            io::SeqReader reader("/tmp/test_debug.fq");
-            if (!reader.is_open()) {
-                std::cout << "  FASTA read: FAIL (can't open file)\n";
+            align::Scoring sc = align::Scoring::bwa_mem_default();
+            // Perfect match
+            std::array<uint8_t, 8> query = {0, 1, 2, 3, 0, 1, 2, 3}; // ACGTACGT
+            std::array<uint8_t, 8> ref = {0, 1, 2, 3, 0, 1, 2, 3};   // ACGTACGT
+
+            align::Alignment aln = align::sw_global(sc, query, ref, 0);
+            bool has_equal = false, has_diff = false;
+            for (uint32_t c : aln.cigar) {
+                auto op = static_cast<align::CigarOp>(c & 0xF);
+                if (op == align::CigarOp::Equal) has_equal = true;
+                if (op == align::CigarOp::Diff) has_diff = true;
+            }
+            if (has_equal && !has_diff && aln.score == 8) {
+                std::cout << "  CIGAR =/X (perfect): OK\n";
             } else {
-                io::SeqRecord rec;
-                int count = 0;
-                while (true) {
-                    auto result = reader.read(rec);
-                    if (!result) break;
-                    if (!*result) break;
-                    count++;
-                    std::cout << "  FASTA read: record " << count
-                              << " name='" << rec.name.view() << "'"
-                              << " seq_len=" << rec.seq.size()
-                              << " seq='" << rec.seq.view() << "'"
-                              << " is_fasta=" << rec.is_fasta() << "\n";
-                }
-                std::cout << "  FASTA read: " << count << " records\n";
+                std::cout << "  CIGAR =/X (perfect): FAIL (has_equal=" << has_equal
+                          << " has_diff=" << has_diff << " score=" << aln.score << ")\n";
+            }
+        }
+
+        // Test CIGAR =/X with mismatches
+        {
+            align::Scoring sc = align::Scoring::bwa_mem_default();
+            // ACGTACGT vs ACGTTCGT (2 mismatches at positions 4,5)
+            std::array<uint8_t, 8> query = {0, 1, 2, 3, 0, 1, 2, 3}; // ACGTACGT
+            std::array<uint8_t, 8> ref = {0, 1, 2, 3, 3, 3, 2, 3};   // ACGTTCGT
+
+            align::Alignment aln = align::sw_global(sc, query, ref, 0);
+            bool has_equal = false, has_diff = false;
+            for (uint32_t c : aln.cigar) {
+                auto op = static_cast<align::CigarOp>(c & 0xF);
+                if (op == align::CigarOp::Equal) has_equal = true;
+                if (op == align::CigarOp::Diff) has_diff = true;
+            }
+            if (has_equal && has_diff) {
+                std::cout << "  CIGAR =/X (mismatches): OK\n";
+            } else {
+                std::cout << "  CIGAR =/X (mismatches): FAIL (has_equal=" << has_equal
+                          << " has_diff=" << has_diff << " score=" << aln.score << ")\n";
             }
         }
 
