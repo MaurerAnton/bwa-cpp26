@@ -241,9 +241,9 @@ public:
             last_error_ = IoError::FileNotFound;
             return false;
         }
-        // Rewind to start (gzseek with SEEK_SET may not work for plain files)
         gzrewind(gz_.get());
         last_line_read_ = false;
+        next_header_.clear();
         return true;
     }
 
@@ -260,19 +260,27 @@ public:
 
         // Read header line (@ or >)
         while (true) {
-            auto result = gz_.readline(line_buf_);
-            if (!result) {
-                if (line_buf_.empty()) {
-                    last_error_ = result.error();
-                    return std::unexpected(last_error_);
+            std::string_view header_line;
+            if (!next_header_.empty()) {
+                header_line = next_header_.view();
+                next_header_.clear();
+            } else {
+                auto result = gz_.readline(line_buf_);
+                if (!result) {
+                    if (line_buf_.empty()) {
+                        last_error_ = result.error();
+                        return std::unexpected(last_error_);
+                    }
+                    header_line = line_buf_.view();
+                } else if (*result == 0 && line_buf_.empty()) {
+                    last_error_ = IoError::Eof;
+                    return false; // EOF
+                } else {
+                    header_line = line_buf_.view();
                 }
-                break;
             }
-            if (*result == 0 && line_buf_.empty()) {
-                last_error_ = IoError::Eof;
-                return false; // EOF
-            }
-            if (!line_buf_.empty() && (line_buf_[0] == '>' || line_buf_[0] == '@')) {
+            if (!header_line.empty() && (header_line[0] == '>' || header_line[0] == '@')) {
+                line_buf_.assign(header_line);
                 break;
             }
             // Skip empty lines
@@ -309,14 +317,9 @@ public:
                 last_line_read_ = true;
                 break;
             }
-            if (!line_buf_.empty() && line_buf_[0] == '>') {
-                // Next FASTA record header
-                last_line_read_ = true;
-                break;
-            }
-            if (!line_buf_.empty() && line_buf_[0] == '@') {
-                // Next FASTQ record header
-                last_line_read_ = true;
+            if (!line_buf_.empty() && (line_buf_[0] == '>' || line_buf_[0] == '@')) {
+                // Next FASTA/FASTQ record header - save for next read
+                next_header_.assign(line_buf_.view());
                 break;
             }
             seq_buf_.append(line_buf_.view());
@@ -398,6 +401,7 @@ private:
     core::PmrString line_buf_;
     core::PmrString seq_buf_;
     core::PmrString qual_buf_;
+    core::PmrString next_header_;  // Stores next header line when peeked
     bool last_line_read_ = false;
     IoError last_error_ = IoError::None;
 };
