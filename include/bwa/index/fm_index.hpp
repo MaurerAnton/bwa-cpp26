@@ -657,6 +657,26 @@ public:
         return static_cast<uint32_t>(result);
     }
 
+    // Locate all positions in range [l, r) - returns vector of SA values
+    // For finding all occurrences of a pattern
+    template <typename OutputIt>
+    void locate_range(size_t l, size_t r, OutputIt out) const noexcept {
+        if (sa_.empty() || l >= r || r > length_) return;
+        for (size_t pos = l; pos < r; ++pos) {
+            if (auto sa_val = locate(pos)) {
+                *out++ = *sa_val;
+            }
+        }
+    }
+
+    // Convenience method returning vector
+    [[nodiscard]] std::vector<uint32_t> locate_all(size_t l, size_t r) const noexcept {
+        std::vector<uint32_t> results;
+        results.reserve(r > l ? r - l : 0);
+        locate_range(l, r, std::back_inserter(results));
+        return results;
+    }
+
     // Count occurrences of pattern
     template <typename Pattern>
     [[nodiscard]] size_t count(const Pattern& pat) const noexcept {
