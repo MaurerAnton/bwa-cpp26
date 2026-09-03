@@ -142,7 +142,6 @@ int main(int argc, char* argv[]) {
                 std::cout << "  SA-IS: FAIL (size=" << sa.size() << ")\n";
             }
         }
-
         // Test FMIndex
         {
             memory::Arena arena(1024 * 1024);

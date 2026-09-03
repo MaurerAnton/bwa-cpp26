@@ -22,6 +22,15 @@
 
 namespace bwa {
 
+// Read group / sample info
+struct ReadGroup {
+    std::string id;
+    std::string sample;
+    std::string library;
+    std::string platform;
+    std::string platform_unit;
+};
+
 // Main configuration
 struct Config {
     // Algorithm parameters
@@ -44,6 +53,14 @@ struct Config {
     bool output_secondary = true;
     bool output_supplementary = true;
     int min_mapq = 1;             // Minimum MAPQ
+
+    // Read group (optional, written as @RG header)
+    std::optional<ReadGroup> read_group;
+
+    // Program info (written as @PG header)
+    std::string program_name = "bwa-cpp26";
+    std::string program_version = "0.1.0";
+    std::string program_command = "bwa-cpp26 mem";
 
     // Memory
     size_t batch_size = 1000;     // Reads per batch
@@ -68,15 +85,6 @@ struct Config {
         c.max_score_drop = 200;
         return c;
     }
-};
-
-// Read group / sample info
-struct ReadGroup {
-    core::PmrString id;
-    core::PmrString sample;
-    core::PmrString library;
-    core::PmrString platform;
-    core::PmrString platform_unit;
 };
 
 // Alignment record (SAM-compatible)

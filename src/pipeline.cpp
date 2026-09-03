@@ -409,6 +409,23 @@ void Pipeline::write_header(std::ostream& out) const {
         out << "@SQ\tSN:" << ref.name
             << "\tLN:" << ref.length << "\n";
     }
+
+    // @RG header (if read group is specified)
+    if (config_.read_group.has_value()) {
+        const auto& rg = config_.read_group.value();
+        out << "@RG\tID:" << rg.id;
+        if (!rg.sample.empty()) out << "\tSM:" << rg.sample;
+        if (!rg.library.empty()) out << "\tLB:" << rg.library;
+        if (!rg.platform.empty()) out << "\tPL:" << rg.platform;
+        if (!rg.platform_unit.empty()) out << "\tPU:" << rg.platform_unit;
+        out << "\n";
+    }
+
+    // @PG header (program info)
+    out << "@PG\tID:" << config_.program_name
+        << "\tPN:" << config_.program_name
+        << "\tVN:" << config_.program_version
+        << "\tCL:" << config_.program_command << "\n";
 }
 
 void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result) const {
