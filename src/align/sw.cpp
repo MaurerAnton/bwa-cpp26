@@ -410,14 +410,11 @@ Alignment sw_extend(const Scoring& sc,
         aln.n_cigar++;
     }
 
-    // Reverse CIGAR to get correct order
-    std::reverse(aln.cigar.begin(), aln.cigar.end());
-
     // Second pass: refine Match ops to = (match) or X (mismatch)
     // We need to walk the alignment again to check actual bases
     // Since CIGAR is in forward order (after reversal), but we track from end, iterate in reverse
-    int32_t q_pos = max_i - 1; // Current query position (0-based, at end of alignment)
-    int32_t r_pos = max_j - 1; // Current ref position (0-based, at end of alignment)
+    int32_t q_pos = qlen - 1; // Current query position (0-based, at end of alignment)
+    int32_t r_pos = rlen - 1; // Current ref position (0-based, at end of alignment)
     
     // We'll build a new CIGAR with = and X split (in reverse order, then reverse at end)
     std::vector<uint32_t> new_cigar_rev;
@@ -436,11 +433,11 @@ Alignment sw_extend(const Scoring& sc,
             
             for (int k = 0; k < len; ++k) {
                 // Since we're iterating CIGAR in reverse, we check bases from current position backwards
-                bool is_match = (query[query_start + q_pos] == ref[ref_start + r_pos]);
+                bool is_match = (query[q_pos] == ref[r_pos]);
                 detail::CigarOp this_op = is_match ? detail::CigarOp::Equal : detail::CigarOp::Diff;
                 
                 if (!sub_op_set) {
-                    sub_op = (q_pos >= 0 && r_pos >= 0 && query[query_start + q_pos] == ref[ref_start + r_pos]) ? detail::CigarOp::Equal : detail::CigarOp::Diff;
+                    sub_op = (q_pos >= 0 && r_pos >= 0 && query[q_pos] == ref[r_pos]) ? detail::CigarOp::Equal : detail::CigarOp::Diff;
                     sub_op_set = true;
                     sub_len = 1;
                 } else if (this_op == sub_op) {

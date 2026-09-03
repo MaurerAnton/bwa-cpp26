@@ -127,7 +127,6 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
 
     const auto& ref_seq = index_.references()[0];
     int32_t ref_len = static_cast<int32_t>(ref_seq.length);
-    int32_t query_len = static_cast<int32_t>(read.seq.size());
 
     // Pack query for SW
     std::vector<uint8_t> query_bytes(query_len);
