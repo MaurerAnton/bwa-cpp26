@@ -37,7 +37,7 @@ struct ReadGroup {
 // Main configuration
 struct Config {
     // Algorithm parameters
-    int min_seed_len = 11;        // Minimum seed length
+    int min_seed_len = 9;         // Minimum seed length (lowered for sensitivity)
     int max_occ = 500;            // Max occurrences for a seed
     int max_gap = 10000;          // Max gap in chaining
     int min_chain_score = 10;     // Minimum chain score

@@ -52,11 +52,26 @@ Alignment sw_semi_global_extend(const Scoring& sc,
     int32_t bw = 2 * w + 1;
 
     using DPState = struct { int32_t h, e, f; };
-    std::vector<DPState> dp((qlen + 1) * bw);
-    std::vector<uint8_t> trace((qlen + 1) * bw, 0);
 
-    auto idx = [&](int32_t i, int32_t j) -> int32_t {
-        return i * bw + (j - i + w);
+    // Use thread-local static buffers to avoid repeated allocations
+    static thread_local std::vector<DPState> dp;
+    static thread_local std::vector<uint8_t> trace;
+
+    size_t dp_size = static_cast<size_t>(qlen + 1) * bw;
+    if (dp.size() < dp_size) {
+        dp.resize(dp_size);
+        trace.resize(dp_size);
+    } else {
+        // Only reset the parts we use
+        std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
+        std::fill_n(trace.data(), dp_size, uint8_t(0));
+    }
+
+    // Precompute index function parameters
+    const int32_t w_val = w;
+    const int32_t bw_val = bw;
+    auto idx = [w_val, bw_val](int32_t i, int32_t j) -> int32_t {
+        return i * bw_val + (j - i + w_val);
     };
 
     // Initialize first row: semi-global allows free gaps in reference at start
@@ -76,21 +91,27 @@ Alignment sw_semi_global_extend(const Scoring& sc,
         trace[id] = 3; // Delete
     }
 
-    // Fill DP matrix
+    // Fill DP matrix - use direct index arithmetic for speed
     for (int32_t i = 1; i <= qlen; ++i) {
         int32_t j_min = std::max(1, i - w);
         int32_t j_max = std::min(rlen, i + w);
 
+        int32_t base_idx = i * bw;
+        int32_t prev_base_idx = (i - 1) * bw;
+
         for (int32_t j = j_min; j <= j_max; ++j) {
-            int32_t cur_idx = idx(i, j);
+            int32_t cur_idx = base_idx + (j - i + w);
 
             int32_t s = (query[i - 1] == ref[j - 1] && query[i - 1] < 4) ? sc.match : sc.mismatch;
 
-            int32_t h_diag = dp[idx(i - 1, j - 1)].h + s;
-            int32_t e = std::max(dp[idx(i, j - 1)].h + sc.gap_open + sc.gap_ext,
-                                  dp[idx(i, j - 1)].e + sc.gap_ext);
-            int32_t f = std::max(dp[idx(i - 1, j)].h + sc.gap_open + sc.gap_ext,
-                                  dp[idx(i - 1, j)].f + sc.gap_ext);
+            int32_t h_diag = dp[prev_base_idx + (j - i + w - 1)].h + s;
+            int32_t e_left = dp[base_idx + (j - 1 - i + w)].h + sc.gap_open + sc.gap_ext;
+            int32_t e_ext = dp[base_idx + (j - 1 - i + w)].e + sc.gap_ext;
+            int32_t e = std::max(e_left, e_ext);
+            int32_t f_up = dp[prev_base_idx + (j - i + w)].h + sc.gap_open + sc.gap_ext;
+            int32_t f_ext = dp[prev_base_idx + (j - i + w)].f + sc.gap_ext;
+            int32_t f = std::max(f_up, f_ext);
+
             int32_t h = std::max({h_diag, e, f});
 
             dp[cur_idx].h = h;
@@ -217,11 +238,26 @@ Alignment sw_extend(const Scoring& sc,
 
     // DP arrays (full 2D for traceback)
     using DPState = struct { int32_t h, e, f; };
-    std::vector<DPState> dp((qlen + 1) * bw);
-    std::vector<uint8_t> trace((qlen + 1) * bw); // 0=None, 1=Match, 2=Insert, 3=Delete
 
-    auto idx = [&](int32_t i, int32_t j) -> int32_t {
-        return i * bw + (j - i + w);
+    // Use thread-local static buffers to avoid repeated allocations
+    static thread_local std::vector<DPState> dp;
+    static thread_local std::vector<uint8_t> trace;
+
+    size_t dp_size = static_cast<size_t>(qlen + 1) * bw;
+    if (dp.size() < dp_size) {
+        dp.resize(dp_size);
+        trace.resize(dp_size);
+    } else {
+        // Only reset the parts we use
+        std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
+        std::fill_n(trace.data(), dp_size, uint8_t(0));
+    }
+
+    // Precompute index function parameters
+    const int32_t w_val = w;
+    const int32_t bw_val = bw;
+    auto idx = [w_val, bw_val](int32_t i, int32_t j) -> int32_t {
+        return i * bw_val + (j - i + w_val);
     };
 
     // Initialize first row (i=0)
@@ -254,11 +290,11 @@ Alignment sw_extend(const Scoring& sc,
             dp[id_left].f = sc.gap_open + sc.gap_ext * (i - j_min + 1);
         }
 
+        int32_t base_idx = i * bw;
+        int32_t prev_base_idx = (i - 1) * bw;
+
         for (int32_t j = j_min; j <= j_max; ++j) {
-            int32_t id = idx(i, j);
-            int32_t id_diag = idx(i - 1, j - 1);
-            int32_t id_up = idx(i - 1, j);
-            int32_t id_left = idx(i, j - 1);
+            int32_t cur_idx = base_idx + (j - i + w);
 
             int32_t s = (query[i - 1] == ref[j - 1] && query[i - 1] < 4) ? sc.match : sc.mismatch;
 

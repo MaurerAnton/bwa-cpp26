@@ -81,43 +81,47 @@ public:
                            mems, false);
     }
 
-    // Rescue scan: find seeds with very short k-mers (k=5)
+    // Rescue scan: find seeds with very short k-mers
     // Used as a last resort when no MEMs are found
     void rescue_scan(const std::span<const uint8_t>& query,
                      core::Vector<MEM>& mems,
                      bool is_fwd) const {
         int32_t qlen = static_cast<int32_t>(query.size());
-        if (qlen < 5) return;
+        if (qlen < 4) return;
 
-        // Try k=5 seeds
-        const int rescue_k = 5;
-        int32_t max_occ_rescue = max_occ_ * 10; // Allow more occurrences for rescue
+        // Try multiple short k values
+        const int rescue_ks[] = {5, 4};
+        int32_t max_occ_rescue = max_occ_ * 20; // Allow many occurrences for rescue
 
-        for (int32_t i = 0; i + rescue_k <= qlen; ++i) {
-            // Check if position has any N
-            bool has_n = false;
-            for (int k = 0; k < rescue_k; ++k) {
-                if (query[i + k] >= 4) { has_n = true; break; }
-            }
-            if (has_n) continue;
+        for (int rescue_k : rescue_ks) {
+            if (qlen < rescue_k) continue;
 
-            // Find exact matches
-            size_t l = 0, r = fm_index_.length();
-            for (int k = rescue_k - 1; k >= 0; --k) {
-                auto [nl, nr] = fm_index_.backward_extend(query[i + k], l, r);
-                if (nl >= nr) { l = 0; r = 0; break; }
-                l = nl; r = nr;
-            }
+            for (int32_t i = 0; i + rescue_k <= qlen; ++i) {
+                // Check if position has any N
+                bool has_n = false;
+                for (int k = 0; k < rescue_k; ++k) {
+                    if (query[i + k] >= 4) { has_n = true; break; }
+                }
+                if (has_n) continue;
 
-            if (r > l && r - l <= static_cast<size_t>(max_occ_rescue)) {
-                if (auto pos = fm_index_.locate(l)) {
-                    MEM mem;
-                    mem.query_pos = i;
-                    mem.ref_pos = *pos;
-                    mem.len = rescue_k;
-                    mem.score = rescue_k * match_score_;
-                    mem.is_forward = is_fwd;
-                    mems.push_back(mem);
+                // Find exact matches
+                size_t l = 0, r = fm_index_.length();
+                for (int k = rescue_k - 1; k >= 0; --k) {
+                    auto [nl, nr] = fm_index_.backward_extend(query[i + k], l, r);
+                    if (nl >= nr) { l = 0; r = 0; break; }
+                    l = nl; r = nr;
+                }
+
+                if (r > l && r - l <= static_cast<size_t>(max_occ_rescue)) {
+                    if (auto pos = fm_index_.locate(l)) {
+                        MEM mem;
+                        mem.query_pos = i;
+                        mem.ref_pos = *pos;
+                        mem.len = rescue_k;
+                        mem.score = rescue_k * match_score_;
+                        mem.is_forward = is_fwd;
+                        mems.push_back(mem);
+                    }
                 }
             }
         }

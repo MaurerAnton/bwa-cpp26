@@ -76,6 +76,14 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     // Reset arena for this read
     memory::reset_tls_arena();
 
+    // Determine effective config based on read length
+    Config effective_config = config_;
+    int32_t query_len = static_cast<int32_t>(read.seq.size());
+    if (query_len > 250 && !config_.read_group.has_value()) {
+        // Auto-switch to long-read config for very long reads
+        effective_config = Config::long_reads();
+    }
+
     // Pack query sequence
     index::PackedSequence query;
     query.append(read.seq.data(), read.seq.size());
@@ -101,7 +109,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     // Chain MEMs
-    auto chains = mem_finder_.chain(mems, config_.max_gap, config_.min_chain_score);
+    auto chains = mem_finder_.chain(mems, effective_config.max_gap, effective_config.min_chain_score);
 
     if (chains.empty()) {
         result.mapped = false;
@@ -130,7 +138,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
 
     // Adaptive scoring based on read length (BWA-MEM style)
     // For longer reads, increase gap penalties to avoid spurious alignments
-    align::Scoring adaptive_scoring = config_.scoring;
+    align::Scoring adaptive_scoring = effective_config.scoring;
     if (query_len > 100) {
         // Scale gap penalties with read length
         adaptive_scoring.gap_open = std::min<int>(-1, static_cast<int>(-0.01 * query_len - 4));
@@ -138,7 +146,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     // Process up to max_secondary alignments (best chain + secondary chains)
-    int max_alignments = std::min<int>(chains.size(), 1 + config_.max_occ / 100);
+    int max_alignments = std::min<int>(chains.size(), 1 + effective_config.max_occ / 100);
     if (max_alignments < 1) max_alignments = 1;
     if (max_alignments > 4) max_alignments = 4; // Cap at 4 total alignments
 
@@ -150,7 +158,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         const auto& chain = chains[ci];
         int32_t chain_ref_begin = chain.mems.front().ref_pos;
 
-        int32_t padding = config_.band_width * 2;
+        int32_t padding = effective_config.band_width * 2;
         int32_t ref_begin = std::max<int32_t>(0, chain_ref_begin - padding);
         int32_t ref_end = std::min<int32_t>(ref_len, chain_ref_begin + query_len + padding);
 
@@ -163,7 +171,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
             adaptive_scoring,
             std::span<const uint8_t>(query_bytes.data(), query_len),
             std::span<const uint8_t>(ref_region.data(), ref_region.size()),
-            config_.band_width
+            effective_config.band_width
         );
 
         if (sw_aln.score > 0) {
@@ -210,7 +218,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     // Use the best alignment as primary
     const auto& [primary_chain_idx, primary_swaln] = all_alignments[0];
     int32_t primary_ref_begin = chains[primary_chain_idx].mems.front().ref_pos;
-    int32_t padding = config_.band_width * 2;
+    int32_t padding = effective_config.band_width * 2;
     int32_t primary_ref_region_begin = std::max<int32_t>(0, primary_ref_begin - padding);
     int32_t final_ref_begin = primary_ref_region_begin + primary_swaln.ref_begin;
     int32_t final_ref_end = primary_ref_region_begin + primary_swaln.ref_end;
