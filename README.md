@@ -1,131 +1,171 @@
-# BWA-CPP26: Modern C++26 Rewrite of BWA
+# BWA-CPP26
 
-A memory-safe, high-performance rewrite of BWA (Burrows-Wheeler Aligner) in C++26.
+A modern C++26 implementation of the Burrows-Wheeler Aligner (BWA-MEM).
 
 ## Features
 
-- **C++26 Standard**: Uses `std::simd`, `std::execution::par`, `std::expected`, `std::mdspan`, `std::format`
-- **Memory Safety**: PMR allocators, arena allocation, bounds-checked containers, no raw pointers in hot paths
-- **Sanitizer-Friendly**: Built with ASan/UBSan/MSan support
-- **Performance**: SIMD-accelerated kernels, cache-friendly data structures, parallel algorithms
-- **Modular Design**: Clean separation of index, alignment, I/O, and core utilities
+- **Modern C++26**: Uses C++26 features for safety and performance
+- **Memory Safe**: Custom arena allocators, no manual memory management
+- **AGPL-3.0-only Licensed**: Same license as original BWA
+- **BWA-MEM Compatible**: Implements the BWA-MEM algorithm for short and long reads
+- **Multi-threading**: Parallel alignment with configurable thread count
+- **SAM/BAM Output**: Standard alignment output formats with BGZF compression
 
-## Architecture
+## Algorithm
 
-```
-bwa-cpp26/
-├── include/bwa/
-│   ├── core/           # Memory, containers, strings, sorting, hashing
-│   ├── index/          # FM-index, BWT, suffix arrays
-│   ├── align/          # MEM finding, Smith-Waterman, chaining
-│   ├── io/             # FASTQ/FASTA/BAM parsing, streaming
-│   └── pipeline.hpp    # High-level API
-├── src/
-│   ├── core/           # Core implementations
-│   ├── index/          # Index building/loading
-│   ├── align/          # Alignment kernels
-│   ├── io/             # I/O implementations
-│   ├── utils/          # Utilities
-│   └── main.cpp        # CLI entry point
-├── tests/
-│   ├── unit/           # Unit tests
-│   ├── integration/    # Integration tests
-│   └── fuzz/           # Fuzz targets
-└── benchmarks/         # Performance benchmarks
-```
-
-## Core Replacements
-
-| C Component | C++26 Replacement |
-|-------------|-------------------|
-| `kvec.h` | `core::Vector<T>` (PMR, SSO, bounds-checked) |
-| `kstring.h` | `core::PmrString` (SSO, `to_chars`, `format_to`) |
-| `khash.h` | `core::HashMap<K,V>` (Robin Hood, heterogeneous lookup) |
-| `kseq.h` | `io::SeqReader` (streaming, gzip, mmap) |
-| `ksort.h` | `core::radix_sort`, `core::parallel_sort` |
-| `kthread.h` | `std::jthread`, `std::execution::par` |
-| `bwt.c` | `index::FMIndex` (SA-IS, sampled SA, occ table) |
-| `ksw.c` | `align::sw_*` (SIMD banded DP) |
+- **MEM Finding**: Uses FM-index with backward search (SMEM algorithm)
+- **Chaining**: DP-based optimal chaining with gap penalties
+- **Alignment**: Banded Smith-Waterman with affine gap costs
+- **Suffix Array**: SA-IS linear-time construction (O(n))
 
 ## Building
 
-### Requirements
-- C++26 compiler (GCC 13+, Clang 16+, MSVC 19.40+)
-- CMake 3.28+
-- zlib (for gzip support)
-- Optional: [Highway](https://github.com/google/highway) for portable SIMD
-- Optional: [Abseil](https://abseil.io) for `flat_hash_map`
-
-### Build Commands
-
 ```bash
-# Configure
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DSANITIZE=OFF
-
-# Build
-cmake --build build -j$(nproc)
-
-# Run tests
-cd build && ctest --output-on-failure
-
-# Run benchmarks
-./build/bwa-bench
-
-# Run self-test
-./build/bwa test
+# Requires: GCC 16.2.1+, zlib
+g++ -std=c++26 -Iinclude -O2 -o bwa-cpp26 \
+    src/main.cpp src/align/sw.cpp src/index/fm_index.cpp \
+    src/pipeline.cpp src/io/seq_io.cpp src/utils/utils.cpp \
+    src/core/arena.cpp -lz
 ```
 
-### Sanitizer Build (for development)
+Or using CMake:
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug -DSANITIZE=ON
-cmake --build build -j$(nproc)
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
 ```
 
 ## Usage
 
+### Build Index
 ```bash
-# Build index
-./bwa index reference.fasta reference.idx
-
-# Single-end alignment
-./bwa mem reference.idx reads.fq > aln.sam
-
-# Paired-end alignment
-./bwa mem reference.idx reads_1.fq reads_2.fq > aln.sam
+bwa-cpp26 index reference.fa index_prefix
 ```
 
-## Memory Model
+### Align Reads (Single-end)
+```bash
+bwa-cpp26 mem index_prefix reads.fq > alignments.sam
+```
 
-- **Thread-local arenas**: Each thread gets a 64KB arena for allocations
-- **PMR polymorphic allocators**: All containers use `std::pmr::polymorphic_allocator`
-- **No global state**: Fully thread-safe, no static initialization order issues
-- **Deterministic cleanup**: RAII everywhere, no memory leaks possible
+### Align Reads (Paired-end)
+```bash
+bwa-cpp26 mem index_prefix reads_1.fq reads_2.fq > alignments.sam
+```
+
+### Output to BAM
+```bash
+bwa-cpp26 mem index_prefix reads.fq | samtools view -b - > alignments.bam
+```
+
+Or directly:
+```bash
+bwa-cpp26 mem index_prefix reads.fq -o alignments.bam
+```
+
+## Configuration
+
+```cpp
+bwa::Config cfg = bwa::Config::default_mem();
+// Or use presets:
+bwa::Config cfg = bwa::Config::fast();
+bwa::Config cfg = bwa::Config::accurate();
+bwa::Config cfg = bwa::Config::long_reads();  // ONT/PacBio
+
+bwa::Pipeline pipeline("index_prefix", cfg);
+pipeline.align_file("reads.fq", "output.sam");
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `min_seed_len` | 19 | Minimum seed length |
+| `max_occ` | 500 | Max seed occurrences |
+| `band_width` | 32 | DP band width |
+| `min_chain_score` | 30 | Minimum chain score |
+| `max_gap` | 10000 | Max gap in chaining |
+| `num_threads` | 1 | Thread count |
+
+## API Example
+
+```cpp
+#include <bwa/pipeline.hpp>
+#include <bwa/io/seq_io.hpp>
+
+int main() {
+    // Build index
+    bwa::Index idx = bwa::Index::build("reference.fa", bwa::Config::default_mem());
+    idx.save("index_prefix");
+    
+    // Load and align
+    bwa::Pipeline pipeline("index_prefix");
+    
+    // Single read
+    bwa::io::SeqRecord read;
+    read.name = "read1";
+    read.seq = "ACGTACGTACGT";
+    read.qual = "IIIIIIIIIIII";
+    
+    auto result = pipeline.aligner().align(read);
+    if (result.mapped) {
+        std::cout << "Aligned to " << result.primary.rname 
+                  << " at " << result.primary.pos << "\n";
+    }
+    
+    // Batch alignment
+    bwa::io::BatchSeqReader reader("reads.fq", 1000);
+    std::vector<bwa::AlignmentResult> results(1000);
+    size_t n = reader.fill();
+    pipeline.aligner().align_batch({reader.buffer().data(), n}, results);
+}
+```
+
+## File Formats
+
+### Index Files
+- `prefix.meta` - Metadata (reference names, lengths, MD5)
+- `prefix.bwt` - Burrows-Wheeler Transform
+- `prefix.sa` - Sampled suffix array
+- `prefix.occ` - Occurrence table
+- `prefix.pac` - Packed reference sequences
+
+### Output Formats
+- **SAM**: Text format with @HD, @SQ, @PG headers
+- **BAM**: Binary format with BGZF compression
 
 ## Testing
 
 ```bash
-# Unit tests
-./build/bwa-tests
+# Run self-tests
+./bwa-cpp26 test
 
-# Fuzzing (with libFuzzer)
-clang++ -fsanitize=fuzzer -std=c++26 -Iinclude tests/fuzz/fuzz_parser.cpp -o fuzz_parser
-./fuzz_parser corpus/
+# Run integration test
+bash tests/integration/test_pipeline.sh
 ```
-
-## Performance Targets
-
-- **Index building**: < 2x original BWA (SA-IS vs prefix-doubling)
-- **Alignment throughput**: > 1.5x original BWA-MEM (SIMD + better memory layout)
-- **Memory usage**: < 1.2x original (packed structures, no fragmentation)
-- **Latency**: P99 < 10ms per read (vs ~50ms in original)
 
 ## License
 
-AGPL-3.0-only
+AGPL-3.0-only - Same as original BWA.
+
+## Differences from Original BWA
+
+| Feature | BWA | BWA-CPP26 |
+|---------|-----|-----------|
+| Language | C | C++26 |
+| Memory | Manual | Arena allocators |
+| SA Construction | SA-IS (C) | SA-IS (C++26) |
+| Threading | pthreads | std::thread |
+| BAM | HTStlib | Native BGZF |
+
+## Roadmap
+
+- [ ] Memory-mapped index files for large genomes
+- [ ] BAI index generation for BAM
+- [ ] Real data testing (Illumina, ONT, PacBio)
+- [ ] Performance benchmarking
+- [ ] Supplementary alignment (SA tag)
+- [ ] Base quality recalibration
 
 ## Contributing
 
-1. All code must pass sanitizers (ASan/UBSan/MSan)
-2. All new code must have unit tests
-3. Performance regressions > 5% require justification
-4. Follow C++ Core Guidelines and C++26 best practices
+See CONTRIBUTING.md for guidelines.
