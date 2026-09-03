@@ -3,7 +3,6 @@
 // Reference: https://samtools.github.io/hts-specs/SAMv1.pdf
 #pragma once
 
-#include <bwa/pipeline.hpp>
 #include <zlib.h>
 #include <cstdint>
 #include <cstring>
@@ -15,9 +14,13 @@
 
 namespace bwa::io {
 
-// Use void* for AlnRecord to avoid circular dependency
-// The caller must pass a valid AlnRecord pointer
-using AlnRecordPtr = const void*;
+// Forward declarations to avoid including pipeline.hpp
+class Pipeline;
+class Config;
+class Index;
+class Aligner;
+struct AlignmentResult;
+struct AlnRecord;
 
 // Helper to extract fields from AlnRecord without including pipeline.hpp
 struct AlnRecordView {
@@ -409,8 +412,10 @@ class BaiWriter {
     struct RefStats {
         int32_t n_mapped = 0;
         int32_t n_unmapped = 0;
-        std::vector<int64_t> bin_offsets[65536]; // Max 65536 bins (only first 16 used typically)
+        std::vector<std::vector<int64_t>> bin_offsets; // 16 bins + 4680
         std::vector<std::pair<int64_t, int64_t>> linear_offsets; // (file_offset, record_count)
+
+        RefStats() : bin_offsets(4681) {} // 16 bins (0-15) + bin 4680
     };
     std::vector<RefStats> ref_stats_;
     int32_t num_refs_ = 0;
@@ -491,6 +496,8 @@ public:
             for (int b = 0; b < 16; ++b) {
                 if (!stats.bin_offsets[b].empty()) n_bin++;
             }
+            // Bin 4680 (unmapped)
+            if (!stats.bin_offsets[4680].empty()) n_bin++;
             write_le32(buf, n_bin);
 
             // Bin chunks
@@ -500,9 +507,16 @@ public:
                     int32_t n_chunk = static_cast<int32_t>(stats.bin_offsets[b].size());
                     write_le32(buf, n_chunk);
                     for (int64_t offset : stats.bin_offsets[b]) {
-                        // BAI stores virtual offsets as 64-bit: (block_offset << 16) | inner_offset
                         write_le64(buf, static_cast<uint64_t>(offset));
                     }
+                }
+            }
+            if (!stats.bin_offsets[4680].empty()) {
+                write_le32(buf, 4680);
+                int32_t n_chunk = static_cast<int32_t>(stats.bin_offsets[4680].size());
+                write_le32(buf, n_chunk);
+                for (int64_t offset : stats.bin_offsets[4680]) {
+                    write_le64(buf, static_cast<uint64_t>(offset));
                 }
             }
 

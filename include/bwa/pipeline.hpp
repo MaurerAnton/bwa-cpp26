@@ -400,6 +400,14 @@ public:
             throw std::runtime_error("Cannot open BAM output file");
         }
 
+        // Open BAI index file
+        std::string bai_path = std::string(bam_path) + ".bai";
+        io::BaiWriter bai_writer;
+        if (!bai_writer.open(bai_path.c_str())) {
+            throw std::runtime_error("Cannot open BAI output file");
+        }
+        bai_writer.init(static_cast<int32_t>(index_.num_references()));
+
         // Build SAM header
         std::stringstream sam_header;
         sam_header << "@HD\tVN:1.6\tSO:coordinate\n";
@@ -443,8 +451,16 @@ public:
                 view.tags = result.primary.tags;
                 view.score = result.primary.score;
                 writer.write_alignment(view, ref_idx);
+
+                // Record alignment in BAI index
+                int64_t file_offset = writer.virtual_offset();
+                bai_writer.record_alignment(ref_idx, result.primary.pos, file_offset);
             }
         });
+
+        // Write BAI index
+        bai_writer.write_index();
+        bai_writer.close();
 
         writer.close();
     }

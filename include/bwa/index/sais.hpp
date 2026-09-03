@@ -21,6 +21,9 @@ namespace bwa::index::detail {
 
 namespace sais {
 
+using namespace bwa::core;
+using namespace bwa::memory;
+
 constexpr uint8_t L_TYPE = 0;
 constexpr uint8_t S_TYPE = 1;
 
