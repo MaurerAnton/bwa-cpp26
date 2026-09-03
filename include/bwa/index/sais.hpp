@@ -109,6 +109,8 @@ inline void induced_sort_s(const uint8_t* T, const uint8_t* t, int32_t n,
         }
     }
 }
+    }
+}
 
 // Main SA-IS recursive function
 // T: input string (with sentinel T[n-1] = 0, T[i] >= 1 for i < n-1)
@@ -220,8 +222,8 @@ inline int32_t sa_is_recursive(const uint8_t* T, int32_t n, int32_t* SA,
 }
 
 // Wrapper for PackedSequence
-inline core::Vector<uint32_t> build_suffix_array(const PackedSequence& seq,
-                                                  memory::Arena& arena) noexcept {
+inline core::Vector<uint32_t> build_suffix_array(const bwa::index::PackedSequence& seq,
+                                                   memory::Arena& arena) noexcept {
     size_t n = seq.size();
     if (n == 0) return {};
 
