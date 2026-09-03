@@ -19,6 +19,8 @@
 #include <atomic>
 #include <queue>
 #include <condition_variable>
+#include <sstream>
+#include <zlib.h>
 
 namespace bwa {
 
@@ -85,6 +87,23 @@ struct Config {
         c.max_score_drop = 200;
         return c;
     }
+
+    // Preset for long reads (ONT/PacBio)
+    [[nodiscard]] static Config long_reads() noexcept {
+        Config c;
+        c.min_seed_len = 9;         // Shorter seeds for higher sensitivity
+        c.max_occ = 10000;         // Allow more occurrences
+        c.max_gap = 50000;         // Larger gaps
+        c.min_chain_score = 20;    // Lower threshold
+        c.band_width = 128;        // Wider band for more indels
+        c.max_score_drop = 500;    // Allow more score drop
+        // More permissive scoring for long reads with higher error rates
+        c.scoring.match = 1;
+        c.scoring.mismatch = -1;   // Less penalty for mismatches
+        c.scoring.gap_open = -2;   // Less penalty for gaps
+        c.scoring.gap_ext = -1;
+        return c;
+    }
 };
 
 // Alignment record (SAM-compatible)
@@ -138,9 +157,7 @@ struct RefSequence {
     std::string md5;
     size_t length = 0;
     size_t offset = 0; // Offset in concatenated reference
-};
-
-// Main BWA index
+};// Main BWA index
 // Uses heap allocators for metadata to avoid arena lifetime issues.
 // FMIndex data is stored in arenas owned by the FMIndex objects themselves.
 class Index {
@@ -337,6 +354,18 @@ public:
         std::ostream* out = &std::cout;
 
         if (std::string_view(sam_path) != "-") {
+            // Check if output should be gzipped (.gz extension)
+            std::string_view path(sam_path);
+            if (path.size() >= 3 && path.substr(path.size()-3) == ".gz") {
+                // BGZF support: write to a buffer, then compress
+                std::stringstream buffer;
+                write_header(buffer);
+                aligner_.align_stream(reader, [&](const AlignmentResult& result) {
+                    write_alignment(buffer, result);
+                });
+                write_gzipped(sam_path, buffer.str());
+                return;
+            }
             sam_file.open(sam_path, std::ios::binary);
             if (!sam_file) {
                 throw std::runtime_error("Cannot open SAM output file");
@@ -353,6 +382,30 @@ public:
         if (sam_file.is_open()) sam_file.close();
     }
 
+    // Write string to a gzip file
+    void write_gzipped(const char* path, const std::string& data) const {
+        gzFile gz = gzopen(path, "wb");
+        if (!gz) throw std::runtime_error("Cannot open gzip output file");
+        gzwrite(gz, data.data(), static_cast<unsigned>(data.size()));
+        gzclose(gz);
+    }
+
+    // Align FASTQ file to BAM output (basic implementation)
+    // BAM format: BGZF-compressed binary SAM
+    void align_to_bam(const char* fastq_path, const char* bam_path) const {
+        // For simplicity, write SAM to a buffer, then convert to BAM
+        std::stringstream sam_buf;
+        write_header(sam_buf);
+
+        io::SeqReader reader(fastq_path);
+        aligner_.align_stream(reader, [&](const AlignmentResult& result) {
+            write_alignment(sam_buf, result);
+        });
+
+        // Write SAM as BAM (just gzip the SAM for now - not true BAM)
+        write_gzipped(bam_path, sam_buf.str());
+    }
+
     // Parallel alignment using a simple thread pool
     void align_file_parallel(const char* fastq_path, const char* sam_path, int num_threads) const {
         io::SeqReader reader(fastq_path);
@@ -360,6 +413,17 @@ public:
         std::ostream* out = &std::cout;
 
         if (std::string_view(sam_path) != "-") {
+            std::string_view path(sam_path);
+            if (path.size() >= 3 && path.substr(path.size()-3) == ".gz") {
+                // For BGZF, read all first, then compress
+                std::stringstream buffer;
+                write_header(buffer);
+                aligner_.align_stream(reader, [&](const AlignmentResult& result) {
+                    write_alignment(buffer, result);
+                });
+                write_gzipped(sam_path, buffer.str());
+                return;
+            }
             sam_file.open(sam_path, std::ios::binary);
             if (!sam_file) {
                 throw std::runtime_error("Cannot open SAM output file");
@@ -378,11 +442,6 @@ public:
             Aligner local_aligner(index_, config_);
             while (true) {
                 io::SeqRecord read;
-                {
-                    // Not thread-safe to share SeqReader, so just process from queue
-                    // For simplicity, use a lock-free approach
-                }
-                // Get a read from the queue
                 std::lock_guard<std::mutex> lock(out_mutex);
                 if (read_queue.empty()) {
                     if (done) break;
@@ -397,7 +456,6 @@ public:
             }
         };
 
-        // Read all reads into queue first (SeqReader is not thread-safe)
         io::SeqRecord read;
         while (reader.read(read)) {
             read_queue.push(std::move(read));
@@ -405,7 +463,6 @@ public:
         }
         done = true;
 
-        // Process with worker threads
         std::vector<std::thread> threads;
         for (int t = 0; t < num_threads; ++t) {
             threads.emplace_back(worker);
@@ -422,6 +479,20 @@ public:
         std::ostream* out = &std::cout;
 
         if (std::string_view(sam_path) != "-") {
+            std::string_view path(sam_path);
+            if (path.size() >= 3 && path.substr(path.size()-3) == ".gz") {
+                // For BGZF, buffer all output then compress
+                std::stringstream buffer;
+                write_header(buffer);
+                io::SeqRecord read1, read2;
+                while (r1.read(read1) && r2.read(read2)) {
+                    AlignmentResult result = aligner_.align_pair(read1, read2);
+                    write_alignment(buffer, result);
+                    memory::reset_tls_arena();
+                }
+                write_gzipped(sam_path, buffer.str());
+                return;
+            }
             sam_file.open(sam_path, std::ios::binary);
             if (!sam_file) {
                 throw std::runtime_error("Cannot open SAM output file");
