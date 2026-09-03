@@ -756,24 +756,21 @@ void Index::load_impl(const char* prefix) {
         refs_.push_back(std::move(ref));
     }
 
-    // Load BWT
+    // Load BWT using memory-mapped file for large genome support
     std::string bwt_path = std::string(prefix) + ".bwt";
-    std::ifstream bwt_in(bwt_path, std::ios::binary);
-    if (!bwt_in) throw std::runtime_error("Cannot open BWT file");
+    io::MmapFile bwt_mmap;
+    bwt_mmap.open(bwt_path.c_str());
+    if (!bwt_mmap.is_open()) throw std::runtime_error("Cannot open BWT file");
 
-    // Determine size and read into buffer
-    bwt_in.seekg(0, std::ios::end);
-    size_t bwt_size = bwt_in.tellg();
-    bwt_in.seekg(0);
-    std::vector<uint64_t> bwt_data(bwt_size / sizeof(uint64_t));
-    bwt_in.read(reinterpret_cast<char*>(bwt_data.data()), bwt_size);
-    bwt_in.close();
+    size_t bwt_size = bwt_mmap.size();
+    const uint64_t* bwt_data = static_cast<const uint64_t*>(bwt_mmap.data());
+    size_t bwt_words = bwt_size / sizeof(uint64_t);
 
     // Create FM index from loaded data (single index for now)
     {
         index::FMIndex idx;
 
-        // Set BWT
+        // Set BWT - directly use mmapped data
         index::PackedSequence bwt;
         bwt.resize(total_len);
         for (size_t i = 0; i < total_len; ++i) {
@@ -788,25 +785,23 @@ void Index::load_impl(const char* prefix) {
 
         // Load SA samples
         std::string sa_path = std::string(prefix) + ".sa";
-        std::ifstream sa_in(sa_path, std::ios::binary);
-        sa_in.seekg(0, std::ios::end);
-        size_t sa_size = sa_in.tellg();
-        sa_in.seekg(0);
-        std::vector<uint32_t> sa_data(sa_size / sizeof(uint32_t));
-        sa_in.read(reinterpret_cast<char*>(sa_data.data()), sa_size);
-        sa_in.close();
-        idx.set_sa_samples(sa_data);
+        io::MmapFile sa_mmap;
+        sa_mmap.open(sa_path.c_str());
+        if (!sa_mmap.is_open()) throw std::runtime_error("Cannot open SA file");
+
+        const uint32_t* sa_data = static_cast<const uint32_t*>(sa_mmap.data());
+        size_t sa_words = sa_mmap.size() / sizeof(uint32_t);
+        idx.set_sa_samples(std::vector<uint32_t>(sa_data, sa_data + sa_words));
 
         // Load occ table
         std::string occ_path = std::string(prefix) + ".occ";
-        std::ifstream occ_in(occ_path, std::ios::binary);
-        occ_in.seekg(0, std::ios::end);
-        size_t occ_size = occ_in.tellg();
-        occ_in.seekg(0);
-        std::vector<uint32_t> occ_data(occ_size / sizeof(uint32_t));
-        occ_in.read(reinterpret_cast<char*>(occ_data.data()), occ_size);
-        occ_in.close();
-        idx.set_occ_table(occ_data);
+        io::MmapFile occ_mmap;
+        occ_mmap.open(occ_path.c_str());
+        if (!occ_mmap.is_open()) throw std::runtime_error("Cannot open OCC file");
+
+        const uint32_t* occ_data = static_cast<const uint32_t*>(occ_mmap.data());
+        size_t occ_words = occ_mmap.size() / sizeof(uint32_t);
+        idx.set_occ_table(std::vector<uint32_t>(occ_data, occ_data + occ_words));
 
         // Build count table from occ
         std::vector<uint32_t> cnt(5, 0);
@@ -823,17 +818,14 @@ void Index::load_impl(const char* prefix) {
 
     // Load packed reference
     std::string pac_path = std::string(prefix) + ".pac";
-    std::ifstream pac_in(pac_path, std::ios::binary);
-    if (!pac_in) {
+    io::MmapFile pac_mmap;
+    pac_mmap.open(pac_path.c_str());
+    if (!pac_mmap.is_open()) {
         // No packed reference - extract_ref will return empty
         return;
     }
-    pac_in.seekg(0, std::ios::end);
-    size_t pac_size = pac_in.tellg();
-    pac_in.seekg(0);
-    std::vector<uint64_t> pac_data(pac_size / sizeof(uint64_t));
-    pac_in.read(reinterpret_cast<char*>(pac_data.data()), pac_size);
-    pac_in.close();
+    const uint64_t* pac_data = static_cast<const uint64_t*>(pac_mmap.data());
+    size_t pac_words = pac_mmap.size() / sizeof(uint64_t);
 
     // Distribute packed data among references
     packed_refs_.resize(refs_.size());
