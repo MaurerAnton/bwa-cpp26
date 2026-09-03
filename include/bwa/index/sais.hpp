@@ -8,6 +8,11 @@
 #include <array>
 #include <algorithm>
 
+// Forward declaration
+namespace bwa::index {
+    class PackedSequence;
+}
+
 namespace bwa::index::detail {
 
 // SA-IS: Linear-time Suffix Array Construction
@@ -95,7 +100,7 @@ inline void induced_sort_l(const uint8_t* T, const uint8_t* t, int32_t n,
 
 inline void induced_sort_s(const uint8_t* T, const uint8_t* t, int32_t n,
                             int32_t* SA,
-                            const int32_t* bucket_starts) noexcept {
+                            int32_t* bucket_starts) noexcept {
     for (int32_t i = 0; i < n; ++i) {
         if (SA[i] <= 0) continue;
         int32_t j = SA[i] - 1;

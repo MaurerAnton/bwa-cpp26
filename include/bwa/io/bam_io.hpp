@@ -402,4 +402,124 @@ public:
     [[nodiscard]] int64_t total_offset() const { return bgzf_.total_offset(); }
 };
 
+// BAI (BAM Index) writer
+// BAI format: http://samtools.github.io/hts-specs/BAIv1.pdf
+class BaiWriter {
+    BgzfWriter bgzf_;
+    struct RefStats {
+        int32_t n_mapped = 0;
+        int32_t n_unmapped = 0;
+        std::vector<int64_t> bin_offsets[65536]; // Max 65536 bins (only first 16 used typically)
+        std::vector<std::pair<int64_t, int64_t>> linear_offsets; // (file_offset, record_count)
+    };
+    std::vector<RefStats> ref_stats_;
+    int32_t num_refs_ = 0;
+
+public:
+    BaiWriter() = default;
+    ~BaiWriter() { close(); }
+
+    [[nodiscard]] bool open(const char* path) {
+        return bgzf_.open(path);
+    }
+
+    void close() {
+        bgzf_.close();
+    }
+
+    // Initialize with number of reference sequences
+    void init(int32_t num_refs) {
+        num_refs_ = num_refs;
+        ref_stats_.assign(num_refs, RefStats{});
+    }
+
+    // Record an alignment for BAI indexing
+    void record_alignment(int32_t ref_idx, int32_t pos, int64_t file_offset) {
+        if (ref_idx < 0 || ref_idx >= num_refs_) return;
+
+        auto& stats = ref_stats_[ref_idx];
+        if (pos < 0) {
+            stats.n_unmapped++;
+            return;
+        }
+        stats.n_mapped++;
+
+        // Calculate bin
+        uint16_t bin = 4680;
+        if (pos < 65536) bin = pos >> 14;
+        else if (pos < 262144) bin = 9 + (pos >> 17);
+        else if (pos < 1048576) bin = 15 + (pos >> 20);
+        else if (pos < 4194304) bin = 21 + (pos >> 23);
+        else if (pos < 16777216) bin = 27 + (pos >> 26);
+
+        stats.bin_offsets[bin].push_back(file_offset);
+
+        // Linear index: every 16384 bases (2^14)
+        int32_t linear_idx = pos >> 14;
+        if (linear_idx >= 0) {
+            if (static_cast<int32_t>(stats.linear_offsets.size()) <= linear_idx) {
+                stats.linear_offsets.resize(linear_idx + 1, {0, 0});
+            }
+            // Keep minimum file offset for this linear index
+            if (stats.linear_offsets[linear_idx].first == 0 || 
+                file_offset < stats.linear_offsets[linear_idx].first) {
+                stats.linear_offsets[linear_idx] = {file_offset, 0};
+            }
+        }
+    }
+
+    // Write the BAI index file
+    void write_index() {
+        std::vector<uint8_t> buf;
+
+        // Magic: "BAI\1"
+        buf.push_back('B');
+        buf.push_back('A');
+        buf.push_back('I');
+        buf.push_back(1);
+
+        // n_ref
+        write_le32(buf, num_refs_);
+
+        // For each reference
+        for (int32_t i = 0; i < num_refs_; ++i) {
+            auto& stats = ref_stats_[i];
+
+            // Bin index: number of bins
+            // BAI uses 16 bins (0-15) + 4680 = 16 bins total
+            int32_t n_bin = 0;
+            for (int b = 0; b < 16; ++b) {
+                if (!stats.bin_offsets[b].empty()) n_bin++;
+            }
+            write_le32(buf, n_bin);
+
+            // Bin chunks
+            for (int b = 0; b < 16; ++b) {
+                if (!stats.bin_offsets[b].empty()) {
+                    write_le32(buf, b);
+                    int32_t n_chunk = static_cast<int32_t>(stats.bin_offsets[b].size());
+                    write_le32(buf, n_chunk);
+                    for (int64_t offset : stats.bin_offsets[b]) {
+                        // BAI stores virtual offsets as 64-bit: (block_offset << 16) | inner_offset
+                        write_le64(buf, static_cast<uint64_t>(offset));
+                    }
+                }
+            }
+
+            // Linear index
+            int32_t n_intv = static_cast<int32_t>(stats.linear_offsets.size());
+            write_le32(buf, n_intv);
+            for (int32_t j = 0; j < n_intv; ++j) {
+                write_le64(buf, static_cast<uint64_t>(stats.linear_offsets[j].first));
+            }
+
+            // n_mapped, n_unmapped (8-byte each)
+            write_le64(buf, static_cast<uint64_t>(stats.n_mapped));
+            write_le64(buf, static_cast<uint64_t>(stats.n_unmapped));
+        }
+
+        bgzf_.write(buf);
+    }
+};
+
 } // namespace bwa::io

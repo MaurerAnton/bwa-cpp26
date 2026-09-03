@@ -478,31 +478,7 @@ inline void sais_main(const uint8_t* T, int32_t n, int32_t* SA) {
         }
     }
 
-    // Induced sort S-type
-    {
-        std::vector<int32_t> bucket_end_copy = bucket_end;
-        for (int32_t i = n - 1; i >= 0; --i) {
-            if (SA[i] > 0) {
-                int32_t j = SA[i] - 1;
-                if (!is_l[j]) {
-                    SA[--bucket_end_copy[T[j]]] = j;
-                }
-            }
-        }
-    }
-}
-
-} // namespace detail::sais
-
-// Build suffix array using SA-IS algorithm - O(n) time
-// Note: SA-IS implementation has memory issues with the recursive call.
-// Using brute-force for now (O(n^2 log n)) which is correct.
-inline core::Vector<uint32_t> build_suffix_array_sais(const PackedSequence& seq,
-                                                       memory::Arena& arena) {
-    return detail::sais::build_suffix_array(seq, arena);
-}
-
-// FM-index with rank/select support
+    // FM-index with rank/select support
 class FMIndex {
 public:
     using occ_t = uint32_t;
