@@ -302,22 +302,8 @@ inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq
 // Reference: "Two Efficient Algorithms for Linear Time Suffix Array Construction"
 namespace detail::sais {
 
-// LMS substring comparison
-// Returns true if LMS substrings starting at a and b are different
-inline bool lms_substrings_differ(const uint8_t* T, int32_t n,
-                                   const std::vector<bool>& is_l,
-                                   int32_t a, int32_t b) {
-    if (a == b) return false;
-    int32_t i = 0;
-    while (a + i < n && b + i < n) {
-        bool a_is_lms = (i > 0 && !is_l[a + i] && is_l[a + i - 1]);
-        bool b_is_lms = (i > 0 && !is_l[b + i] && is_l[b + i - 1]);
-        if (T[a + i] != T[b + i]) return true;
-        if (i > 0 && a_is_lms && b_is_lms) return false; // Both ended at LMS
-        if (i > 0 && a_is_lms != b_is_lms) return true; // One ended, other didn't
-        ++i;
-    }
-    return (a + i != n) || (b + i != n);
+inline core::Vector<uint32_t> build_suffix_array(const PackedSequence& seq,
+                                                  memory::Arena& arena) noexcept;
 }
 
 // SA-IS main function
@@ -513,7 +499,7 @@ inline void sais_main(const uint8_t* T, int32_t n, int32_t* SA) {
 // Using brute-force for now (O(n^2 log n)) which is correct.
 inline core::Vector<uint32_t> build_suffix_array_sais(const PackedSequence& seq,
                                                        memory::Arena& arena) {
-    return build_suffix_array_brute(seq, arena);
+    return detail::sais::build_suffix_array(seq, arena);
 }
 
 // FM-index with rank/select support
