@@ -8,6 +8,7 @@
 #include <bwa/align/mem.hpp>
 #include <bwa/align/sw.hpp>
 #include <bwa/io/seq_io.hpp>
+#include <bwa/io/bam_io.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>

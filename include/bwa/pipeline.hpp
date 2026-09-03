@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <sstream>
 #include <zlib.h>
+#include <bwa/io/bam_io.hpp>
 
 namespace bwa {
 
@@ -390,20 +391,60 @@ public:
         gzclose(gz);
     }
 
-    // Align FASTQ file to BAM output (basic implementation)
-    // BAM format: BGZF-compressed binary SAM
+    // Align FASTQ file to BAM output (proper BAM format with BGZF)
     void align_to_bam(const char* fastq_path, const char* bam_path) const {
-        // For simplicity, write SAM to a buffer, then convert to BAM
-        std::stringstream sam_buf;
-        write_header(sam_buf);
+        io::BamWriter writer;
+        if (!writer.open(bam_path)) {
+            throw std::runtime_error("Cannot open BAM output file");
+        }
 
+        // Build SAM header
+        std::stringstream sam_header;
+        sam_header << "@HD\tVN:1.6\tSO:coordinate\n";
+        for (size_t i = 0; i < index_.num_references(); ++i) {
+            const auto& ref = index_.get_ref(i);
+            sam_header << "@SQ\tSN:" << ref.name << "\tLN:" << ref.length;
+            if (!ref.md5.empty()) sam_header << "\tM5:" << ref.md5;
+            sam_header << "\n";
+        }
+        sam_header << "@PG\tID:" << config_.program_name
+                   << "\tPN:" << config_.program_name
+                   << "\tVN:" << config_.program_version << "\n";
+
+        // Write BAM header
+        writer.write_header(sam_header.str(), static_cast<int32_t>(index_.num_references()));
+
+        // Write reference sequences
+        for (size_t i = 0; i < index_.num_references(); ++i) {
+            const auto& ref = index_.get_ref(i);
+            writer.write_reference(static_cast<int32_t>(ref.length), ref.name);
+        }
+
+        // Align and write
         io::SeqReader reader(fastq_path);
         aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-            write_alignment(sam_buf, result);
+            if (result.mapped) {
+                int32_t ref_idx = 0; // Single reference for now
+                // Convert AlnRecord to AlnRecordView
+                io::AlnRecordView view;
+                view.qname = result.primary.qname;
+                view.flag = result.primary.flag;
+                view.rname = result.primary.rname;
+                view.pos = result.primary.pos;
+                view.mapq = result.primary.mapq;
+                view.cigar = result.primary.cigar;
+                view.rnext = result.primary.rnext;
+                view.pnext = result.primary.pnext;
+                view.tlen = result.primary.tlen;
+                view.seq = result.primary.seq;
+                view.qual = result.primary.qual;
+                view.tags = result.primary.tags;
+                view.score = result.primary.score;
+                writer.write_alignment(view, ref_idx);
+            }
         });
 
-        // Write SAM as BAM (just gzip the SAM for now - not true BAM)
-        write_gzipped(bam_path, sam_buf.str());
+        writer.close();
     }
 
     // Parallel alignment using a simple thread pool
