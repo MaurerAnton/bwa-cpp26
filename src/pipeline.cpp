@@ -119,6 +119,12 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     // Process best chain
     const auto& best_chain = chains[0];
 
+    // Process secondary chains for XS tag (suboptimal alignment score)
+    int32_t suboptimal_score = 0;
+    if (chains.size() > 1) {
+        suboptimal_score = chains[1].score;
+    }
+
     // Get reference sequence info
     if (index_.num_references() == 0) {
         result.mapped = false;
@@ -190,6 +196,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
         result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
         result.primary.score = best_chain.score;
+        result.suboptimal_score = suboptimal_score;
         result.primary.seq = std::string(read.seq.view());
         result.primary.qual = std::string(read.qual.view());
 
@@ -465,8 +472,10 @@ void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result)
         return;
     }
 
-    // Write primary alignment
-    write_sam_record(out, result.primary);
+    // Write primary alignment with suboptimal score
+    AlnRecord primary = result.primary;
+    primary.suboptimal_score = result.suboptimal_score;
+    write_sam_record(out, primary);
 
     // Write secondary alignments
     for (const auto& sec : result.secondary) {
@@ -490,6 +499,10 @@ void Pipeline::write_sam_record(std::ostream& out, const AlnRecord& aln) const {
     // Optional tags
     for (const auto& tag : aln.tags) {
         out << '\t' << tag.first << ':' << tag.second;
+    }
+    // XS tag: suboptimal alignment score
+    if (aln.suboptimal_score > 0) {
+        out << "\tXS:i:" << aln.suboptimal_score;
     }
     out << '\n';
 }

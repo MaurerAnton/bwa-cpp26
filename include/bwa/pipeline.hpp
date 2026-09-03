@@ -108,7 +108,6 @@ struct Config {
 };
 
 // Alignment record (SAM-compatible)
-// Uses std::string/std::vector for persistent storage (arena-safe)
 struct AlnRecord {
     std::string qname;          // Query name
     uint32_t flag = 0;        // SAM flag
@@ -122,6 +121,7 @@ struct AlnRecord {
     std::string seq;            // Query sequence
     std::string qual;           // Query quality
     std::vector<std::pair<std::string, std::string>> tags; // Optional tags
+    int32_t suboptimal_score = 0;  // XS tag: suboptimal alignment score
 
     // Computed fields
     int32_t score = 0;
@@ -134,6 +134,7 @@ struct AlnRecord {
         cigar.clear(); rnext = "*"; pnext = 0; tlen = 0;
         seq.clear(); qual.clear(); tags.clear();
         score = secondary_score = 0;
+        suboptimal_score = 0;
         is_primary = true; is_supplementary = false;
     }
 
@@ -246,10 +247,11 @@ struct AlignmentResult {
     bool mapped = false;
     int32_t best_score = 0;
     int32_t second_best_score = 0;
+    int32_t suboptimal_score = 0;  // XS tag: suboptimal alignment score
 
     void clear() noexcept {
         primary.clear(); secondary.clear(); supplementary.clear();
-        mapped = false; best_score = second_best_score = 0;
+        mapped = false; best_score = second_best_score = suboptimal_score = 0;
     }
 };
 
