@@ -95,14 +95,49 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         return;
     }
 
-    // Find MEMs (use TLS arena for memory)
-    bwa::memory::Arena& arena = bwa::memory::get_tls_arena();
-    auto mems = mem_finder_.find(query.bases(), arena);
-    mem_finder_.filter_overlaps(mems);
+    // Empty index: nothing to align against
+    if (index_.num_references() == 0) {
+        result.mapped = false;
+        return;
+    }
 
-    // Rescue scan if no MEMs found
-    if (mems.empty()) {
-        mem_finder_.rescue_scan(query.bases(), mems, true);
+    // Find MEMs on every reference (use TLS arena for memory).
+    // Previously only fm_index()[0] was searched, making all other
+    // references invisible. Each MEM is tagged with its ref_id.
+    bwa::memory::Arena& arena = bwa::memory::get_tls_arena();
+    bwa::core::Vector<bwa::align::MEM> mems(&arena);
+    const size_t num_refs = index_.num_references();
+    std::vector<size_t> ref_mem_counts(num_refs, 0);
+    for (size_t ri = 0; ri < num_refs; ++ri) {
+        if (ri >= index_.fm_index().num_sequences()) continue;
+        if (index_.references()[ri].length == 0) continue;
+        bwa::align::MEMFinder finder(index_.fm_index()[ri],
+                                     mem_finder_.min_seed_len(),
+                                     mem_finder_.max_occ(),
+                                     mem_finder_.match_score());
+        auto found = finder.find(query.bases(), arena);
+        for (size_t i = 0; i < found.size(); ++i) {
+            found[i].ref_id = static_cast<int32_t>(ri);
+            mems.push_back(found[i]);
+        }
+        ref_mem_counts[ri] = found.size();
+    }
+    bwa::align::MEMFinder::filter_overlaps(mems);
+
+    // Rescue scan per reference lacking MEMs
+    for (size_t ri = 0; ri < num_refs; ++ri) {
+        if (ref_mem_counts[ri] > 0) continue;
+        if (ri >= index_.fm_index().num_sequences()) continue;
+        if (index_.references()[ri].length == 0) continue;
+        bwa::align::MEMFinder finder(index_.fm_index()[ri],
+                                     mem_finder_.min_seed_len(),
+                                     mem_finder_.max_occ(),
+                                     mem_finder_.match_score());
+        size_t before = mems.size();
+        finder.rescue_scan(query.bases(), mems, true);
+        for (size_t i = before; i < mems.size(); ++i) {
+            mems[i].ref_id = static_cast<int32_t>(ri);
+        }
     }
 
     if (mems.empty()) {
@@ -127,14 +162,27 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         suboptimal_score = chains[1].score;
     }
 
-    // Get reference sequence info
-    if (index_.num_references() == 0) {
-        result.mapped = false;
-        return;
-    }
-
-    const auto& ref_seq = index_.references()[0];
-    int32_t ref_len = static_cast<int32_t>(ref_seq.length);
+    // Helper: reference + global-coordinate window for a chain.
+    // MEM ref_pos is local to its reference; extract_ref takes global
+    // concatenated coordinates (ref.offset + local).
+    auto chain_ref_window = [&](const bwa::align::MEMFinder::Chain& chain,
+                                int32_t& ref_id_out,
+                                int32_t& ref_begin_out,
+                                int32_t& ref_end_out) -> bool {
+        ref_id_out = chain.mems.front().ref_id;
+        if (ref_id_out < 0 ||
+            static_cast<size_t>(ref_id_out) >= index_.num_references()) {
+            return false;
+        }
+        const auto& ref = index_.references()[static_cast<size_t>(ref_id_out)];
+        int32_t ref_len = static_cast<int32_t>(ref.length);
+        int32_t global_base = static_cast<int32_t>(ref.offset);
+        int32_t local_begin = chain.mems.front().ref_pos;
+        int32_t padding = effective_config.band_width * 2;
+        ref_begin_out = global_base + std::max<int32_t>(0, local_begin - padding);
+        ref_end_out = global_base + std::min<int32_t>(ref_len, local_begin + query_len + padding);
+        return ref_end_out > ref_begin_out;
+    };
 
     // Pack query for SW
     std::vector<uint8_t> query_bytes(query_len);
@@ -163,13 +211,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
 
     for (int32_t ci = 0; ci < max_alignments && ci < (int32_t)chains.size(); ++ci) {
         const auto& chain = chains[ci];
-        int32_t chain_ref_begin = chain.mems.front().ref_pos;
-
-        int32_t padding = effective_config.band_width * 2;
-        int32_t ref_begin = std::max<int32_t>(0, chain_ref_begin - padding);
-        int32_t ref_end = std::min<int32_t>(ref_len, chain_ref_begin + query_len + padding);
-
-        if (ref_end <= ref_begin) continue;
+        int32_t ref_id = 0, ref_begin = 0, ref_end = 0;
+        if (!chain_ref_window(chain, ref_id, ref_begin, ref_end)) continue;
 
         auto ref_region = index_.extract_ref(ref_begin, ref_end);
         if (ref_region.empty()) continue;
@@ -187,14 +230,16 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     }
 
     if (all_alignments.empty()) {
-        // Fall back to simple CIGAR from best chain
-        int32_t ref_pos = best_chain.mems[0].ref_pos;
+        // Fall back to simple CIGAR from best chain (on its own reference)
+        const auto& bmem = best_chain.mems[0];
+        const auto& bref = index_.references()[static_cast<size_t>(best_chain.ref_id)];
+        int32_t ref_pos = bmem.ref_pos;
         result.mapped = true;
         result.best_score = best_chain.score;
         result.best_score = best_chain.score;
         result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
         result.primary.qname = std::string(read.name.view());
-        result.primary.rname = ref_seq.name;
+        result.primary.rname = bref.name;
         result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
         result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
         result.primary.score = best_chain.score;
@@ -223,13 +268,19 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     std::sort(all_alignments.begin(), all_alignments.end(),
               [](const auto& a, const auto& b) { return a.second.score > b.second.score; });
 
-    // Use the best alignment as primary
+    // Use the best alignment as primary (positions local to its reference,
+    // while extract_ref needs global concatenated coordinates)
     const auto& [primary_chain_idx, primary_swaln] = all_alignments[0];
-    int32_t primary_ref_begin = chains[primary_chain_idx].mems.front().ref_pos;
-    int32_t padding = effective_config.band_width * 2;
-    int32_t primary_ref_region_begin = std::max<int32_t>(0, primary_ref_begin - padding);
-    int32_t final_ref_begin = primary_ref_region_begin + primary_swaln.ref_begin;
-    int32_t final_ref_end = primary_ref_region_begin + primary_swaln.ref_end;
+    const auto& pchain = chains[primary_chain_idx];
+    int32_t p_ref_id = 0, p_ref_begin = 0, p_ref_end = 0;
+    chain_ref_window(pchain, p_ref_id, p_ref_begin, p_ref_end);
+    const auto& pref = index_.references()[static_cast<size_t>(p_ref_id)];
+    int32_t p_global_base = static_cast<int32_t>(pref.offset);
+    int32_t p_global_end = p_global_base + static_cast<int32_t>(pref.length);
+    int32_t primary_local_region_begin = p_ref_begin - p_global_base;
+    int32_t final_local_begin = primary_local_region_begin + primary_swaln.ref_begin;
+    int32_t final_ref_begin = p_ref_begin + primary_swaln.ref_begin;
+    int32_t final_ref_end = p_ref_begin + primary_swaln.ref_end;
 
     result.mapped = true;
     result.best_score = primary_swaln.score;
@@ -237,8 +288,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
 
     // Build primary alignment
     result.primary.qname = std::string(read.name.view());
-    result.primary.rname = ref_seq.name;
-    result.primary.pos = final_ref_begin + 1;
+    result.primary.rname = pref.name;
+    result.primary.pos = final_local_begin + 1;
     result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
     result.primary.score = primary_swaln.score;
     result.primary.seq = std::string(read.seq.view());
@@ -255,7 +306,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     }
     result.primary.tags.push_back({"NM", std::to_string(nm)});
 
-    // MD tag
+    // MD tag (positions are global concatenated coordinates here;
+    // the leading number is the match run length, per SAM spec)
     std::string md;
     int32_t ref_pos_in_aln = final_ref_begin;
     int32_t run_len = 0;
@@ -267,24 +319,24 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             run_len += len;
             ref_pos_in_aln += len;
         } else if (op == bwa::align::CigarOp::Diff) {
-            if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
-            else { md += std::to_string(run_len); }
+            md += std::to_string(run_len);
+            first = false;
             run_len = 0;
             for (int k = 0; k < len; ++k) {
                 if (k > 0) md += "0";
-                if (ref_pos_in_aln < ref_len) {
+                if (ref_pos_in_aln < p_global_end) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
                     md += !ref_base.empty() ? bwa::index::PackedSequence::decode_base(ref_base[0]) : 'N';
                 } else { md += 'N'; }
                 ref_pos_in_aln++;
             }
         } else if (op == bwa::align::CigarOp::Del) {
-            if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
-            else { md += std::to_string(run_len); }
+            md += std::to_string(run_len);
+            first = false;
             run_len = 0;
             md += '^';
             for (int k = 0; k < len; ++k) {
-                if (ref_pos_in_aln < ref_len) {
+                if (ref_pos_in_aln < p_global_end) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
                     md += !ref_base.empty() ? bwa::index::PackedSequence::decode_base(ref_base[0]) : 'N';
                 } else { md += 'N'; }
@@ -296,19 +348,21 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     else { md += std::to_string(run_len); }
     result.primary.tags.push_back({"MD", md});
 
-    // Add secondary alignments
+    // Add secondary alignments (each on its own chain's reference)
     for (size_t i = 1; i < all_alignments.size() && i < 4; ++i) {
         const auto& [sec_chain_idx, sec_swaln] = all_alignments[i];
-        int32_t sec_ref_begin = chains[sec_chain_idx].mems.front().ref_pos;
-        int32_t sec_ref_region_begin = std::max<int32_t>(0, sec_ref_begin - padding);
-        int32_t sec_final_begin = sec_ref_region_begin + sec_swaln.ref_begin;
-        int32_t sec_final_end = sec_ref_region_begin + sec_swaln.ref_end;
+        const auto& schain = chains[sec_chain_idx];
+        int32_t s_ref_id = 0, s_ref_begin = 0, s_ref_end = 0;
+        if (!chain_ref_window(schain, s_ref_id, s_ref_begin, s_ref_end)) continue;
+        const auto& sref = index_.references()[static_cast<size_t>(s_ref_id)];
+        int32_t sec_local_begin = (s_ref_begin - static_cast<int32_t>(sref.offset)) +
+                                  sec_swaln.ref_begin;
 
         AlnRecord sec;
         sec.qname = std::string(read.name.view());
         sec.flag = AlnRecord::F_SECONDARY;
-        sec.rname = ref_seq.name;
-        sec.pos = sec_final_begin + 1;
+        sec.rname = sref.name;
+        sec.pos = sec_local_begin + 1;
         sec.mapq = compute_mapq(result.best_score, sec_swaln.score);
         sec.score = sec_swaln.score;
         sec.seq = std::string(read.seq.view());
@@ -768,54 +822,85 @@ void Index::load_impl(const char* prefix) {
     const uint64_t* bwt_data = static_cast<const uint64_t*>(bwt_mmap.data());
     size_t bwt_words = bwt_size / sizeof(uint64_t);
 
-    // Create FM index from loaded data (single index for now)
+    // Reconstruct one FM-index per reference, keeping fm_index_[ri] aligned
+    // with refs_[ri]. save_impl writes each index's BWT/SA/occ arrays
+    // consecutively, so split the blobs using per-ref sizes from metadata.
+    // (A single combined index would be invalid: BWT(concat) != concat(BWTs).)
     {
-        bwa::index::FMIndex idx;
+        size_t bwt_word_off = 0;  // in uint64_t words
+        for (size_t ri = 0; ri < num_refs; ++ri) {
+            const size_t len = refs_[ri].length;
 
-        // Set BWT - directly use mmapped data
-        bwa::index::PackedSequence bwt;
-        bwt.resize(total_len);
-        for (size_t i = 0; i < total_len; ++i) {
-            // Unpack the 2-bit values from the uint64_t array
-            size_t wi = i / 32;
-            size_t bi = (i % 32) * 2;
-            uint8_t val = (bwt_data[wi] >> bi) & 0x3;
-            bwt.set(i, val);
+            bwa::index::FMIndex idx;
+            idx.set_size(len);
+
+            // BWT slice: (len+31)/32 words of 2-bit bases
+            bwa::index::PackedSequence bwt;
+            bwt.resize(len);
+            for (size_t i = 0; i < len; ++i) {
+                size_t wi = bwt_word_off + i / 32;
+                size_t bi = (i % 32) * 2;
+                uint8_t val = 0;
+                if (wi < bwt_words) {
+                    val = static_cast<uint8_t>((bwt_data[wi] >> bi) & 0x3);
+                }
+                bwt.set(i, val);
+            }
+            bwt_word_off += (len + 31) / 32;
+            idx.set_bwt(bwt);
+
+            fm_index_.add_index(std::move(idx));
         }
-        idx.set_bwt(bwt);
-        idx.set_size(total_len);
+    }
 
-        // Load SA samples
+    // Load SA samples (one slice per reference)
+    {
         std::string sa_path = std::string(prefix) + ".sa";
         bwa::io::MmapFile sa_mmap;
         sa_mmap.open(sa_path.c_str());
         if (!sa_mmap.is_open()) throw std::runtime_error("Cannot open SA file");
 
         const uint32_t* sa_data = static_cast<const uint32_t*>(sa_mmap.data());
-        size_t sa_words = sa_mmap.size() / sizeof(uint32_t);
-        idx.set_sa_samples(std::vector<uint32_t>(sa_data, sa_data + sa_words));
+        size_t sa_avail = sa_mmap.size() / sizeof(uint32_t);
+        size_t off = 0;
+        for (size_t ri = 0; ri < num_refs; ++ri) {
+            size_t want = (refs_[ri].length + 31) / 32;
+            size_t have = (off < sa_avail) ? std::min(want, sa_avail - off) : 0;
+            fm_index_[ri].set_sa_samples(
+                std::vector<uint32_t>(sa_data + off, sa_data + off + have));
+            off += want;
+        }
+    }
 
-        // Load occ table
+    // Load occ tables + rebuild count tables per reference
+    {
         std::string occ_path = std::string(prefix) + ".occ";
         bwa::io::MmapFile occ_mmap;
         occ_mmap.open(occ_path.c_str());
         if (!occ_mmap.is_open()) throw std::runtime_error("Cannot open OCC file");
 
         const uint32_t* occ_data = static_cast<const uint32_t*>(occ_mmap.data());
-        size_t occ_words = occ_mmap.size() / sizeof(uint32_t);
-        idx.set_occ_table(std::vector<uint32_t>(occ_data, occ_data + occ_words));
+        size_t occ_avail = occ_mmap.size() / sizeof(uint32_t);
+        size_t off = 0;
+        for (size_t ri = 0; ri < num_refs; ++ri) {
+            size_t len = refs_[ri].length;
+            size_t num_intv = (len + 128 - 1) / 128 + 1;
+            size_t want = num_intv * 4;
+            size_t have = (off < occ_avail) ? std::min(want, occ_avail - off) : 0;
+            std::vector<uint32_t> occ(occ_data + off, occ_data + off + have);
+            if (occ.size() < want) occ.resize(want, 0);
+            off += want;
+            fm_index_[ri].set_occ_table(occ);
 
-        // Build count table from occ
-        std::vector<uint32_t> cnt(5, 0);
-        for (int b = 0; b < 4; ++b) {
-            // Last interval has final count
-            size_t last_intv = (total_len + 128 - 1) / 128;
-            cnt[b + 1] = cnt[b] + occ_data[last_intv * 4 + b];
+            // Rebuild count table from this ref's final interval
+            std::vector<uint32_t> cnt(5, 0);
+            size_t last_intv = (len + 128 - 1) / 128;
+            for (int b = 0; b < 4; ++b) {
+                cnt[static_cast<size_t>(b) + 1] =
+                    cnt[static_cast<size_t>(b)] + occ[last_intv * 4 + static_cast<size_t>(b)];
+            }
+            fm_index_[ri].set_count_table(cnt);
         }
-        idx.set_count_table(cnt);
-
-        // Add to fm_index_
-        fm_index_.add_index(std::move(idx));
     }
 
     // Load packed reference
@@ -829,18 +914,23 @@ void Index::load_impl(const char* prefix) {
     const uint64_t* pac_data = static_cast<const uint64_t*>(pac_mmap.data());
     size_t pac_words = pac_mmap.size() / sizeof(uint64_t);
 
-    // Distribute packed data among references
+    // Distribute packed data among references. save_impl writes each ref's
+    // whole 2-bit words consecutively, so advance by whole words per ref
+    // (a flat base cursor would drift when a length isn't a multiple of 32).
     packed_refs_.resize(refs_.size());
-    size_t offset = 0;
+    size_t word_off = 0;
     for (size_t i = 0; i < refs_.size(); ++i) {
         packed_refs_[i].resize(refs_[i].length);
         for (size_t j = 0; j < refs_[i].length; ++j) {
-            size_t wi = offset / 32;
-            size_t bi = (offset % 32) * 2;
-            uint8_t val = (pac_data[wi] >> bi) & 0x3;
+            size_t wi = word_off + j / 32;
+            size_t bi = (j % 32) * 2;
+            uint8_t val = 0;
+            if (wi < pac_words) {
+                val = static_cast<uint8_t>((pac_data[wi] >> bi) & 0x3);
+            }
             packed_refs_[i].set(j, val);
-            ++offset;
         }
+        word_off += (refs_[i].length + 31) / 32;
     }
 }
 

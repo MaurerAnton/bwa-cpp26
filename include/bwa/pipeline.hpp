@@ -266,7 +266,8 @@ class Aligner {
 public:
     Aligner(const Index& idx, const Config& cfg = Config::default_mem())
         : index_(idx), config_(cfg),
-          mem_finder_(idx.fm_index()[0], cfg.min_seed_len, cfg.max_occ, cfg.scoring.match),
+          mem_finder_(idx.num_references() > 0 ? idx.fm_index()[0] : empty_fm_index(),
+                      cfg.min_seed_len, cfg.max_occ, cfg.scoring.match),
           arena_(64 * 1024) {}
 
     // Align single read
@@ -309,6 +310,12 @@ public:
     [[nodiscard]] const Index& index() const noexcept { return index_; }
 
 private:
+    // Fallback FM-index for empty references (avoids UB from fm_index()[0])
+    static const index::FMIndex& empty_fm_index() {
+        static const index::FMIndex empty;
+        return empty;
+    }
+
     void align_impl(const io::SeqRecord& read, AlignmentResult& result) const;
     void align_pair_impl(const io::SeqRecord& read1,
                          const io::SeqRecord& read2,

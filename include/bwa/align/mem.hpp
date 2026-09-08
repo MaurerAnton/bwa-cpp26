@@ -18,7 +18,8 @@ namespace bwa::align {
 // Maximal Exact Match (MEM)
 struct MEM {
     int32_t query_pos = 0;    // Start position in query (0-based)
-    int32_t ref_pos = 0;      // Start position in reference (0-based)
+    int32_t ref_pos = 0;      // Start position in reference (0-based, local to ref_id)
+    int32_t ref_id = 0;       // Reference sequence index (for multi-ref indexes)
     int32_t len = 0;          // Length of match
     int32_t score = 0;        // Score (len * match_score)
     bool is_forward = true;   // Strand
@@ -26,7 +27,8 @@ struct MEM {
     [[nodiscard]] int32_t query_end() const noexcept { return query_pos + len; }
     [[nodiscard]] int32_t ref_end() const noexcept { return ref_pos + len; }
     [[nodiscard]] bool contains(const MEM& other) const noexcept {
-        return query_pos <= other.query_pos && query_end() >= other.query_end() &&
+        return ref_id == other.ref_id &&
+               query_pos <= other.query_pos && query_end() >= other.query_end() &&
                ref_pos <= other.ref_pos && ref_end() >= other.ref_end();
     }
 };
@@ -276,13 +278,15 @@ public:
     static void filter_overlaps(core::Vector<MEM>& mems) {
         if (mems.size() <= 1) return;
 
-        // Sort by query position, then by length descending
+        // Sort by query position, then by length descending (ref_id for determinism)
         core::sort(mems.begin(), mems.end(),
                    [](const MEM& a, const MEM& b) {
-                       if (a.query_pos != b.query_pos)
-                           return a.query_pos < b.query_pos;
-                       return a.len > b.len;
-                   });
+                        if (a.query_pos != b.query_pos)
+                            return a.query_pos < b.query_pos;
+                        if (a.ref_id != b.ref_id)
+                            return a.ref_id < b.ref_id;
+                        return a.len > b.len;
+                    });
 
         core::Vector<MEM> filtered;
         filtered.reserve(mems.size());
@@ -290,6 +294,9 @@ public:
         for (const MEM& mem : mems) {
             bool contained = false;
             for (const MEM& kept : filtered) {
+                // Only suppress MEMs on the same reference: MEMs on different
+                // references are alternative mappings, not duplicates.
+                if (kept.ref_id != mem.ref_id) continue;
                 if (kept.contains(mem)) {
                     contained = true;
                     break;
@@ -304,10 +311,10 @@ public:
                 }
             }
             if (!contained) {
-                // Remove any kept that are contained by this
+                // Remove any kept that are contained by this (same reference only)
                 auto it = filtered.begin();
                 while (it != filtered.end()) {
-                    if (mem.contains(*it)) {
+                    if (it->ref_id == mem.ref_id && mem.contains(*it)) {
                         it = filtered.erase(it);
                     } else {
                         ++it;
@@ -324,12 +331,15 @@ public:
     struct Chain {
         core::Vector<MEM> mems;
         int32_t score = 0;
+        int32_t ref_id = 0;   // Reference all MEMs in this chain belong to
         int32_t query_begin = 0, query_end = 0;
         int32_t ref_begin = 0, ref_end = 0;
     };
 
     // DP-based optimal chaining (BWA-MEM style)
-    // Finds the highest-scoring chain of colinear MEMs
+    // Finds the highest-scoring chain of colinear MEMs.
+    // MEMs are grouped by reference: chains never span references.
+    // Returned chains are sorted by score descending (chains[0] is best).
     core::Vector<Chain> chain(const core::Vector<MEM>& mems,
                         int32_t max_gap = 10000,
                         int32_t min_chain_score = 30) const {
@@ -344,6 +354,7 @@ public:
         }
         std::sort(sorted_mems.begin(), sorted_mems.end(),
                   [](const MEM& a, const MEM& b) {
+                      if (a.ref_id != b.ref_id) return a.ref_id < b.ref_id;
                       if (a.query_pos != b.query_pos) return a.query_pos < b.query_pos;
                       return a.ref_pos < b.ref_pos;
                   });
@@ -355,8 +366,16 @@ public:
         Chain current;
         current.mems.push_back(sorted_mems[0]);
         current.score = sorted_mems[0].score;
+        current.ref_id = sorted_mems[0].ref_id;
         current.query_begin = current.query_end = sorted_mems[0].query_end();
         current.ref_begin = current.ref_end = sorted_mems[0].ref_end();
+
+        auto flush_current = [&]() {
+            if (current.score >= min_chain_score) {
+                chains.push_back(std::move(current));
+            }
+            current = Chain{};
+        };
 
         for (int32_t i = 1; i < n; ++i) {
             const MEM& mem = sorted_mems[i];
@@ -365,26 +384,27 @@ public:
             int32_t qgap = mem.query_pos - last.query_end();
             int32_t rgap = mem.ref_pos - last.ref_end();
 
-            if (qgap >= 0 && rgap >= 0 && qgap <= max_gap && rgap <= max_gap) {
+            if (mem.ref_id == current.ref_id &&
+                qgap >= 0 && rgap >= 0 && qgap <= max_gap && rgap <= max_gap) {
                 current.mems.push_back(mem);
                 current.score += mem.score - std::max(qgap, rgap);
                 current.query_end = mem.query_end();
                 current.ref_end = mem.ref_end();
             } else {
-                if (current.score >= min_chain_score) {
-                    chains.push_back(std::move(current));
-                }
-                current = Chain{};
+                flush_current();
                 current.mems.push_back(mem);
                 current.score = mem.score;
+                current.ref_id = mem.ref_id;
                 current.query_begin = current.query_end = mem.query_end();
                 current.ref_begin = current.ref_end = mem.ref_end();
             }
         }
 
-        if (current.score >= min_chain_score) {
-            chains.push_back(std::move(current));
-        }
+        flush_current();
+
+        // Best chain first (aligner takes chains[0] as primary)
+        std::sort(chains.begin(), chains.end(),
+                  [](const Chain& a, const Chain& b) { return a.score > b.score; });
 
         return chains;
     }

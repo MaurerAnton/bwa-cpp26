@@ -2,7 +2,10 @@
 #include <bwa/align/mem.hpp>
 #include <bwa/index/fm_index.hpp>
 #include <bwa/core/arena.hpp>
+#include <bwa/pipeline.hpp>
 #include <iostream>
+#include <fstream>
+#include <cstdio>
 #include <array>
 
 using namespace bwa;
@@ -66,6 +69,46 @@ int main() {
         test("MEM find", mems.size() > 0);
         auto chains = finder.chain(mems, 10000, 5);
         test("MEM chain", chains.size() > 0);
+    }
+
+    // Multi-reference alignment: reads must map to the correct contig.
+    // Regression test: the aligner previously searched only fm_index()[0],
+    // making all other references invisible.
+    {
+        const char* fa_path = "/tmp/bwa_test_multiref.fa";
+        std::string chrA_seq, chrB_seq;
+        for (int i = 0; i < 32; ++i) { chrA_seq += "ACGT"; chrB_seq += "TGCA"; }
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrA\n" << chrA_seq << "\n";
+            fa << ">chrB\n" << chrB_seq << "\n";
+        }
+        Index idx = Index::build(fa_path);
+        test("MultiRef num references", idx.num_references() == 2);
+        Aligner aligner(idx);
+
+        io::SeqRecord readA, readB;
+        readA.name = "readA";
+        readA.seq = "ACGTACGTACGTACGTACGT";  // chrA only
+        readA.qual = "IIIIIIIIIIIIIIIIIIII";
+        readB.name = "readB";
+        readB.seq = "TGCATGCATGCATGCATGCA";  // chrB only
+        readB.qual = "IIIIIIIIIIIIIIIIIIII";
+
+        AlignmentResult resA = aligner.align(readA);
+        test("MultiRef readA mapped", resA.mapped);
+        test("MultiRef readA rname", resA.primary.rname == "chrA");
+        test("MultiRef readA pos", resA.primary.pos >= 1 &&
+             resA.primary.pos <= 128 - 20 + 1);
+        test("MultiRef readA cigar", !resA.primary.cigar.empty());
+
+        AlignmentResult resB = aligner.align(readB);
+        test("MultiRef readB mapped", resB.mapped);
+        test("MultiRef readB rname", resB.primary.rname == "chrB");
+        test("MultiRef readB pos", resB.primary.pos >= 1 &&
+             resB.primary.pos <= 128 - 20 + 1);
+
+        std::remove(fa_path);
     }
 
     std::cout << "\nResults: " << passed << " passed, " << failed << " failed\n";
