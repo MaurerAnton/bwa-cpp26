@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
             index::PackedSequence seq;
             seq.append("ACGTAACCGGTTAA", 14);
 
-            auto sa = index::build_suffix_array_sais(seq, arena);
+            auto sa = index::detail::sais::build_suffix_array(seq, arena);
 
             // Verify: SA should have 14 entries
             if (sa.size() == 14) {

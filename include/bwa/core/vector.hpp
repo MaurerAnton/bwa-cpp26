@@ -1,6 +1,5 @@
 #pragma once
 
-#include <bwa/core/arena.hpp>
 #include <span>
 #include <vector>
 #include <algorithm>
@@ -11,6 +10,8 @@
 #include <utility>
 #include <iterator>
 #include <type_traits>
+
+#include <bwa/core/arena.hpp>
 
 namespace bwa::core {
 
@@ -128,7 +129,7 @@ private:
 
 public:
     // Constructors
-    Vector() noexcept(std::is_nothrow_default_constructible_v<Allocator>)
+    Vector() noexcept(noexcept(Allocator()))
         : capacity_(use_inline() ? InlineCapacity : 0) {
         if (use_inline()) {
             // Mark inline buffer as uninitialized

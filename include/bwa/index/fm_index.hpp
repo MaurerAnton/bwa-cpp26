@@ -1,10 +1,5 @@
 #pragma once
 
-#include <bwa/core/vector.hpp>
-#include <bwa/core/string.hpp>
-#include <bwa/core/arena.hpp>
-#include <bwa/core/sort.hpp>
-#include <bwa/index/sais.hpp>
 #include <span>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +8,12 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+
+#include <bwa/core/vector.hpp>
+#include <bwa/core/string.hpp>
+#include <bwa/core/arena.hpp>
+#include <bwa/core/sort.hpp>
+#include <bwa/index/sais.hpp>
 
 namespace bwa::index {
 
@@ -295,6 +296,8 @@ inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq
               });
 
     return sa;
+}
+
 // FM-index with rank/select support
 class FMIndex {
 public:
@@ -478,8 +481,29 @@ public:
         // Allocate working memory from arena
         size_t n = seq.size();
 
-        // SA-IS: O(n) linear-time suffix array construction
-        core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
+        // SA-IS: O(n) linear-time suffix array construction is currently
+        // disabled: the SA-IS implementation corrupts the heap (out-of-bounds
+        // writes, see SA producing UINT_MAX entries). Use verified brute-force
+        // O(n^2 log n) until SA-IS is fixed. TODO: re-enable with verification.
+        // core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
+        core::Vector<uint32_t> sa_core = build_suffix_array_brute(seq, arena);
+        bool sais_valid = (sa_core.size() == n);
+        if (sais_valid) {
+            for (size_t i = 0; i < n; ++i) {
+                if (sa_core[i] >= n) { sais_valid = false; break; }
+            }
+        }
+        // Check permutation (all values distinct)
+        if (sais_valid && n > 0) {
+            std::vector<char> seen(n, 0);
+            for (size_t i = 0; i < n; ++i) {
+                if (seen[sa_core[i]]) { sais_valid = false; break; }
+                seen[sa_core[i]] = 1;
+            }
+        }
+        if (!sais_valid) {
+            sa_core = build_suffix_array_brute(seq, arena);
+        }
 
         // Build BWT from SA
         for (size_t i = 0; i < n; ++i) {

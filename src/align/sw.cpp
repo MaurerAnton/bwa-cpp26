@@ -96,20 +96,17 @@ Alignment sw_semi_global_extend(const Scoring& sc,
         int32_t j_min = std::max(1, i - w);
         int32_t j_max = std::min(rlen, i + w);
 
-        int32_t base_idx = i * bw;
-        int32_t prev_base_idx = (i - 1) * bw;
-
         for (int32_t j = j_min; j <= j_max; ++j) {
-            int32_t cur_idx = base_idx + (j - i + w);
+            int32_t cur_idx = idx(i, j);
 
             int32_t s = (query[i - 1] == ref[j - 1] && query[i - 1] < 4) ? sc.match : sc.mismatch;
 
-            int32_t h_diag = dp[prev_base_idx + (j - i + w - 1)].h + s;
-            int32_t e_left = dp[base_idx + (j - 1 - i + w)].h + sc.gap_open + sc.gap_ext;
-            int32_t e_ext = dp[base_idx + (j - 1 - i + w)].e + sc.gap_ext;
+            int32_t h_diag = dp[idx(i - 1, j - 1)].h + s;
+            int32_t e_left = dp[idx(i, j - 1)].h + sc.gap_open + sc.gap_ext;
+            int32_t e_ext = dp[idx(i, j - 1)].e + sc.gap_ext;
             int32_t e = std::max(e_left, e_ext);
-            int32_t f_up = dp[prev_base_idx + (j - i + w)].h + sc.gap_open + sc.gap_ext;
-            int32_t f_ext = dp[prev_base_idx + (j - i + w)].f + sc.gap_ext;
+            int32_t f_up = dp[idx(i - 1, j)].h + sc.gap_open + sc.gap_ext;
+            int32_t f_ext = dp[idx(i - 1, j)].f + sc.gap_ext;
             int32_t f = std::max(f_up, f_ext);
 
             int32_t h = std::max({h_diag, e, f});

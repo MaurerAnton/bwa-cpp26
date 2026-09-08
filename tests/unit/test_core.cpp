@@ -3,10 +3,12 @@
 #include <bwa/core/string.hpp>
 #include <bwa/core/hash_map.hpp>
 #include <bwa/core/sort.hpp>
+#include <bwa/index/fm_index.hpp>
 #include <iostream>
 #include <string>
 #include <vector>
 
+using namespace bwa;
 using namespace bwa::core;
 
 int main() {
@@ -104,8 +106,8 @@ int main() {
         test("String string_view", sv == s3.view());
 
         // Find
-        test("String find", s3.find("255") != PmrString::NPOS);
-        test("String rfind", s3.rfind("f") != PmrString::NPOS);
+        test("String find", s3.find(std::string_view("255")) != PmrString::NPOS);
+        test("String rfind", s3.rfind('f') != PmrString::NPOS);
 
         // Substr
         PmrString sub = s3.substr(0, 5);
@@ -133,15 +135,15 @@ int main() {
 
         // String keys
         PmrHashMap<PmrString, int> sm;
-        sm.insert("foo", 1);
-        sm.insert("bar", 2);
-        test("HashMap string key", sm.find("foo")->second == 1);
+        sm.insert(PmrString("foo"), 1);
+        sm.insert(PmrString("bar"), 2);
+        test("HashMap string key", sm.find(PmrString("foo"))->second == 1);
 
         // khash compatibility
-        sm.kh_put("baz");
-        test("HashMap kh_put", sm.contains("baz"));
-        sm.kh_del("bar");
-        test("HashMap kh_del", !sm.contains("bar"));
+        (void)sm.kh_put(PmrString("baz"));
+        test("HashMap kh_put", sm.contains(PmrString("baz")));
+        sm.kh_del(PmrString("bar"));
+        test("HashMap kh_del", !sm.contains(PmrString("bar")));
     }
 
     // HashSet tests
@@ -158,21 +160,21 @@ int main() {
     {
         Vector<int> v;
         for (int i = 100; i >= 0; --i) v.push_back(i);
-        core::radix_sort(v);
+        radix_sort(v);
         bool ok = true;
         for (int i = 0; i <= 100; ++i) if (v[i] != i) ok = false;
         test("RadixSort unsigned", ok);
 
         Vector<int> v2;
         for (int i = -50; i <= 50; ++i) v2.push_back(i);
-        core::radix_sort(v2);
+        radix_sort(v2);
         ok = true;
         for (int i = 0; i <= 100; ++i) if (v2[i] != i - 50) ok = false;
         test("RadixSort signed", ok);
 
         Vector<float> v3;
         for (int i = 100; i >= 0; --i) v3.push_back(float(i) * 0.1f);
-        core::radix_sort(v3);
+        radix_sort(v3);
         ok = true;
         for (int i = 0; i <= 100; ++i) if (v3[i] != float(i) * 0.1f) ok = false;
         test("RadixSort float", ok);
@@ -180,21 +182,21 @@ int main() {
         // Pair sort
         Vector<uint32_t> keys = {3, 1, 4, 1, 5, 9};
         Vector<int> vals = {30, 10, 40, 11, 50, 90};
-        core::radix_sort_pairs(keys, vals);
+        radix_sort_pairs(keys, vals);
         ok = true;
         for (size_t i = 1; i < keys.size(); ++i) if (keys[i-1] > keys[i]) ok = false;
         test("RadixSort pairs", ok && vals[0] == 10 && vals[1] == 11);
 
         // Argsort
         Vector<int> v4 = {5, 2, 8, 1, 9};
-        auto idx = core::argsort(v4);
+        auto idx = argsort(v4);
         ok = idx.size() == 5 && idx[0] == 3 && idx[1] == 1 && idx[4] == 4;
         test("Argsort", ok);
     }
 
     // PackedSequence tests
     {
-        using index::PackedSequence;
+        using bwa::index::PackedSequence;
         PackedSequence seq;
         seq.append("ACGTACGTNN", 10);
         test("PackedSequence size", seq.size() == 10);
@@ -208,12 +210,19 @@ int main() {
         for (uint8_t b : seq) { (void)b; ++count; }
         test("PackedSequence iter", count == 10);
 
-        // Reverse complement
+        // Reverse complement: ACGT is self-complementary (revcomp == ACGT)
         PackedSequence seq2;
         seq2.append("ACGT", 4);
         seq2.reverse_complement();
-        test("PackedSequence revcomp", seq2.get(0) == 3 && seq2.get(1) == 2 &&
-             seq2.get(2) == 1 && seq2.get(3) == 0);
+        test("PackedSequence revcomp", seq2.get(0) == 0 && seq2.get(1) == 1 &&
+             seq2.get(2) == 2 && seq2.get(3) == 3);
+
+        // Non-palindromic: AAAA -> TTTT
+        PackedSequence seq3;
+        seq3.append("AAAA", 4);
+        seq3.reverse_complement();
+        test("PackedSequence revcomp AAAA->TTTT", seq3.get(0) == 3 && seq3.get(1) == 3 &&
+             seq3.get(2) == 3 && seq3.get(3) == 3);
 
         // To string
         PmrString out;

@@ -1,9 +1,5 @@
 #pragma once
 
-#include <bwa/index/fm_index.hpp>
-#include <bwa/core/vector.hpp>
-#include <bwa/core/string.hpp>
-#include <bwa/core/arena.hpp>
 #include <span>
 #include <cstdint>
 #include <array>
@@ -11,6 +7,11 @@
 #include <limits>
 #include <vector>
 #include <numeric>
+
+#include <bwa/index/fm_index.hpp>
+#include <bwa/core/vector.hpp>
+#include <bwa/core/string.hpp>
+#include <bwa/core/arena.hpp>
 
 namespace bwa::align {
 
@@ -400,15 +401,18 @@ public:
 };
 
 // SMEM iterator for streaming MEM finding
+// Mirrors MEMFinder::find_strand: FM backward search processes the query
+// from right to left, so the iterator extends leftwards from the right end.
 class SMEMIterator {
     const index::FMIndex& fm_index_;
     std::span<const uint8_t> query_;
     int min_len_;
     int max_occ_;
-    int32_t i_ = 0;
-    int32_t l_ = 0, r_ = 0;
-    int32_t best_l_ = 0, best_r_ = 0, best_j_ = 0;
-    bool exhausted_ = false;
+    int32_t i_ = -1;      // right end of current search region (inclusive)
+    int32_t best_l_ = 0;  // FM interval of longest acceptable match
+    int32_t best_j_ = 0;  // left end (inclusive) of longest acceptable match
+    int32_t stop_j_ = 0;  // where backward extension stopped (for advancing)
+    bool exhausted_ = true;
 
 public:
     SMEMIterator(const index::FMIndex& idx,
@@ -417,7 +421,8 @@ public:
                  int max_occ = 500)
         : fm_index_(idx), query_(query), min_len_(min_len), max_occ_(max_occ) {
         if (!query_.empty()) {
-            l_ = 0; r_ = fm_index_.length();
+            i_ = static_cast<int32_t>(query_.size()) - 1;
+            exhausted_ = false;
             advance_to_next();
         }
     }
@@ -427,16 +432,18 @@ public:
     std::optional<MEM> next() {
         if (exhausted_) return std::nullopt;
 
-        int32_t mem_len = best_j_ - i_;
         MEM mem;
-        mem.query_pos = i_;
-        if (auto pos = fm_index_.locate(best_l_)) {
-            mem.ref_pos = *pos;
+        mem.query_pos = best_j_ + 1;
+        if (auto pos = fm_index_.locate(static_cast<size_t>(best_l_))) {
+            mem.ref_pos = static_cast<int32_t>(*pos);
         }
-        mem.len = mem_len;
-        mem.score = mem_len;
+        mem.len = i_ - best_j_;
+        mem.score = mem.len;
         mem.is_forward = true;
 
+        // Advance past this MEM (from the right), as in find_strand
+        if (stop_j_ == i_) --i_;
+        else i_ = stop_j_;
         advance_to_next();
         return mem;
     }
@@ -445,31 +452,38 @@ private:
     void advance_to_next() {
         int32_t qlen = static_cast<int32_t>(query_.size());
 
-        while (i_ < qlen) {
-            // Skip N's
-            while (i_ < qlen && query_[i_] >= 4) ++i_;
-            if (i_ >= qlen) { exhausted_ = true; return; }
+        while (i_ >= 0) {
+            // Skip N's (from right)
+            while (i_ >= 0 && query_[static_cast<size_t>(i_)] >= 4) --i_;
+            if (i_ < 0) { exhausted_ = true; return; }
 
-            l_ = 0; r_ = fm_index_.length();
+            // Extend backward as long as possible
+            int32_t l = 0, r = fm_index_.length();
             int32_t j = i_;
-            best_l_ = l_; best_r_ = r_; best_j_ = j;
+            best_l_ = l; best_j_ = j;
 
-            while (j < qlen && query_[j] < 4) {
-                auto [new_l, new_r] = fm_index_.backward_extend(query_[j], l_, r_);
+            while (j >= 0 && query_[static_cast<size_t>(j)] < 4) {
+                auto [new_l, new_r] = fm_index_.backward_extend(
+                    query_[static_cast<size_t>(j)],
+                    static_cast<size_t>(l), static_cast<size_t>(r));
                 if (new_l >= new_r) break;
-                l_ = new_l; r_ = new_r; ++j;
+                l = static_cast<int32_t>(new_l);
+                r = static_cast<int32_t>(new_r);
+                --j;
 
-                if (r_ - l_ <= max_occ_) {
-                    best_l_ = l_; best_r_ = r_; best_j_ = j;
+                if (r - l <= max_occ_) {
+                    best_l_ = l; best_j_ = j;
                 }
             }
+            stop_j_ = j;
 
-            if (best_j_ - i_ >= min_len_) {
+            if (i_ - best_j_ >= min_len_) {
                 return; // Found MEM
             }
 
-            if (j == i_) ++i_;
+            if (j == i_) --i_;
             else i_ = j;
+            (void)qlen;
         }
 
         exhausted_ = true;

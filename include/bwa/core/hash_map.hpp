@@ -1,8 +1,5 @@
 #pragma once
 
-#include <bwa/core/arena.hpp>
-#include <bwa/core/vector.hpp>
-#include <bwa/core/string.hpp>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -13,6 +10,10 @@
 #include <type_traits>
 #include <bit>
 #include <concepts>
+
+#include <bwa/core/arena.hpp>
+#include <bwa/core/vector.hpp>
+#include <bwa/core/string.hpp>
 
 namespace bwa::core {
 
@@ -126,11 +127,15 @@ private:
 
     template <typename K, typename V>
     std::pair<Entry*, bool> insert_impl(K&& k, V&& v) {
+        // Materialize mutable owned copies: handles heterogeneous keys
+        // (const char* -> PmrString) and const lvalues for robin-hood swaps.
+        Key cur_key(std::forward<K>(k));
+        Value cur_val(std::forward<V>(v));
         if (size_ + deleted_ >= capacity_ * MAX_LOAD_FACTOR) {
             rehash(capacity_ * 2);
         }
 
-        size_type hash = hasher_(k);
+        size_type hash = hasher_(cur_key);
         size_type bucket = hash_to_bucket(hash);
         uint32_t probe_dist = 0;
 
@@ -138,7 +143,8 @@ private:
             Entry& entry = entries_[bucket];
             if (entry.state == State::Empty) {
                 // Found empty slot - insert here
-                EntryAllocTraits::construct(alloc_, &entry, std::forward<K>(k), std::forward<V>(v), probe_dist);
+                EntryAllocTraits::construct(alloc_, &entry, std::move(cur_key),
+                                            std::move(cur_val), probe_dist);
                 entry.state = State::Occupied;
                 ++size_;
                 return {&entry, true};
@@ -150,16 +156,16 @@ private:
                 uint32_t existing_probe_dist = (bucket >= ideal_bucket) ?
                     bucket - ideal_bucket : bucket + capacity_ - ideal_bucket;
 
-                if (key_equal_(entry.key, k)) {
-                    // Key exists - update value
-                    entry.value = std::forward<V>(v);
+                if (key_equal_(entry.key, cur_key)) {
+                    // Key exists - do NOT overwrite (std::insert semantics).
+                    // operator[] relies on this to look up without clobbering.
                     return {&entry, false};
                 }
 
                 // Robin hood: if we've probed further than existing entry, swap
                 if (probe_dist > existing_probe_dist) {
-                    std::swap(entry.key, k);
-                    std::swap(entry.value, v);
+                    std::swap(entry.key, cur_key);
+                    std::swap(entry.value, cur_val);
                     std::swap(entry.probe_dist, probe_dist);
                     // Continue with displaced entry
                 }
@@ -382,7 +388,7 @@ public:
     template <typename K>
     Value& operator[](K&& k) {
         auto [entry, inserted] = insert_impl(std::forward<K>(k), Value{});
-        return entry->second;
+        return entry->value;
     }
 
     template <typename K>
@@ -434,11 +440,22 @@ public:
         return {it, it == end() ? end() : std::next(it)};
     }
 
-    // Insert
+    // Insert (std semantics: no overwrite if key exists)
     template <typename K, typename V>
     std::pair<iterator, bool> insert(K&& k, V&& v) {
         auto [entry, inserted] = insert_impl(std::forward<K>(k), std::forward<V>(v));
         return {iterator(entry, entries_ + capacity_), inserted};
+    }
+
+    // Insert or assign (overwrite if key exists)
+    template <typename K, typename V>
+    std::pair<iterator, bool> insert_or_assign(K&& k, V&& v) {
+        auto it = find(k);
+        if (it != end()) {
+            it->second = std::forward<V>(v);
+            return {it, false};
+        }
+        return insert(std::forward<K>(k), std::forward<V>(v));
     }
 
     template <typename K, typename V>
@@ -575,7 +592,8 @@ public:
 
     template <typename K>
     std::pair<iterator, bool> insert(K&& k) {
-        return Base::insert_impl(std::forward<K>(k), std::byte{});
+        auto [it, inserted] = Base::insert(std::forward<K>(k), std::byte{});
+        return {it, inserted};
     }
 
     template <typename... Args>

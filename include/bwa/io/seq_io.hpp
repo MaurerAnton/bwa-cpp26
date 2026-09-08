@@ -1,8 +1,5 @@
 #pragma once
 
-#include <bwa/core/string.hpp>
-#include <bwa/core/vector.hpp>
-#include <bwa/core/arena.hpp>
 #include <span>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +13,10 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <bwa/core/string.hpp>
+#include <bwa/core/vector.hpp>
+#include <bwa/core/arena.hpp>
 
 namespace bwa::io {
 

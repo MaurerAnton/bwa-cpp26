@@ -1,14 +1,15 @@
 #pragma once
 
-#include <bwa/core/vector.hpp>
-#include <bwa/core/string.hpp>
-#include <bwa/core/arena.hpp>
 #include <span>
 #include <cstdint>
 #include <array>
 #include <algorithm>
 #include <limits>
 #include <concepts>
+
+#include <bwa/core/vector.hpp>
+#include <bwa/core/string.hpp>
+#include <bwa/core/arena.hpp>
 
 namespace bwa::align {
 

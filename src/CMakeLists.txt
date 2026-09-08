@@ -13,6 +13,7 @@ target_compile_features(bwa-core PUBLIC cxx_std_26)
 # BWA Index Library
 add_library(bwa-index STATIC
     index/fm_index.cpp
+    index/sais.cpp
 )
 
 target_link_libraries(bwa-index PUBLIC bwa-core)
@@ -34,6 +35,7 @@ target_include_directories(bwa-align PUBLIC
 # BWA IO Library
 add_library(bwa-io STATIC
     io/seq_io.cpp
+    io/bai_io.cpp
 )
 
 target_link_libraries(bwa-io PUBLIC bwa-core)
@@ -71,32 +73,26 @@ target_link_libraries(bwa PRIVATE
     ZLIB::ZLIB
 )
 
-# Tests
-add_executable(bwa-tests
-    ../tests/unit/test_core.cpp
-    ../tests/unit/test_index.cpp
-    ../tests/unit/test_align.cpp
-)
+# Tests (one binary per suite: each test file defines its own main())
+foreach(_t core index align)
+    add_executable(bwa-test-${_t} ../tests/unit/test_${_t}.cpp)
+    target_link_libraries(bwa-test-${_t} PRIVATE
+        bwa-core bwa-index bwa-align bwa-io bwa-pipeline bwa-utils
+        Threads::Threads
+        ZLIB::ZLIB
+    )
+    add_test(NAME bwa_test_${_t} COMMAND bwa-test-${_t})
+endforeach()
 
-target_link_libraries(bwa-tests PRIVATE
-    bwa-core bwa-index bwa-align bwa-io bwa-pipeline bwa-utils
-    Threads::Threads
-    ZLIB::ZLIB
-)
-
-add_test(NAME bwa_unit_tests COMMAND bwa-tests)
-
-# Benchmarks
-add_executable(bwa-bench
-    ../benchmarks/bench_core.cpp
-    ../benchmarks/bench_align.cpp
-)
-
-target_link_libraries(bwa-bench PRIVATE
-    bwa-core bwa-index bwa-align bwa-io bwa-pipeline bwa-utils
-    Threads::Threads
-    ZLIB::ZLIB
-)
+# Benchmarks (one binary per bench: each bench file defines its own main())
+foreach(_b core align)
+    add_executable(bwa-bench-${_b} ../benchmarks/bench_${_b}.cpp)
+    target_link_libraries(bwa-bench-${_b} PRIVATE
+        bwa-core bwa-index bwa-align bwa-io bwa-pipeline bwa-utils
+        Threads::Threads
+        ZLIB::ZLIB
+    )
+endforeach()
 
 # Install
 install(TARGETS bwa

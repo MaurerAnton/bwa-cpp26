@@ -102,6 +102,11 @@ public:
         return upstream_.allocate(bytes, alignment);
     }
 
+    template <typename T>
+    T* allocate(std::size_t n) {
+        return static_cast<T*>(allocate(n * sizeof(T), alignof(T)));
+    }
+
     void deallocate(void* ptr, std::size_t bytes, std::size_t alignment) {
         // Arena doesn't support individual deallocation - use reset() or let arena die
         // Only deallocate if it was allocated from upstream (not from our buffer)

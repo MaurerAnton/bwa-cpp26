@@ -1,3 +1,4 @@
+#include <ranges>  // Must be first to avoid namespace pollution in C++26
 #include <bwa/pipeline.hpp>
 #include <bwa/core/arena.hpp>
 #include <bwa/core/vector.hpp>
@@ -9,6 +10,7 @@
 #include <bwa/align/sw.hpp>
 #include <bwa/io/seq_io.hpp>
 #include <bwa/io/bam_io.hpp>
+#include <bwa/io/bai_io.hpp>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -22,7 +24,7 @@
 #include <iomanip>
 #include <sstream>
 
-using namespace bwa;
+namespace bwa {
 
 namespace {
 
@@ -30,8 +32,8 @@ namespace {
 std::string format_cigar(const std::vector<uint32_t>& cigar) {
     std::string s;
     for (uint32_t c : cigar) {
-        int len = align::cigar_len(c);
-        char op = align::cigar_char(align::cigar_op(c));
+        int len = bwa::align::cigar_len(c);
+        char op = bwa::align::cigar_char(bwa::align::cigar_op(c));
         s += std::to_string(len);
         s += op;
     }
@@ -39,7 +41,7 @@ std::string format_cigar(const std::vector<uint32_t>& cigar) {
 }
 
 // Helper: extract a subregion of the packed reference as uint8_t span
-std::vector<uint8_t> extract_ref_region(const index::FMIndex& fm,
+std::vector<uint8_t> extract_ref_region(const bwa::index::FMIndex& fm,
                                         size_t start, size_t end) {
     std::vector<uint8_t> result;
     if (end > fm.length()) end = fm.length();
@@ -70,11 +72,11 @@ std::vector<uint8_t> extract_ref_segment(size_t ref_start, size_t ref_len) {
 
 } // anonymous namespace
 
-void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) const {
+void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result) const {
     result.clear();
 
     // Reset arena for this read
-    memory::reset_tls_arena();
+    bwa::memory::reset_tls_arena();
 
     // Determine effective config based on read length
     Config effective_config = config_;
@@ -85,7 +87,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     // Pack query sequence
-    index::PackedSequence query;
+    bwa::index::PackedSequence query;
     query.append(read.seq.data(), read.seq.size());
 
     if (query.size() == 0) {
@@ -94,7 +96,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 
     // Find MEMs (use TLS arena for memory)
-    memory::Arena& arena = memory::get_tls_arena();
+    bwa::memory::Arena& arena = bwa::memory::get_tls_arena();
     auto mems = mem_finder_.find(query.bases(), arena);
     mem_finder_.filter_overlaps(mems);
 
@@ -143,7 +145,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
 
     // Adaptive scoring based on read length (BWA-MEM style)
     // For longer reads, increase gap penalties to avoid spurious alignments
-    align::Scoring adaptive_scoring = effective_config.scoring;
+    bwa::align::Scoring adaptive_scoring = effective_config.scoring;
     if (query_len > 100) {
         // Scale gap penalties with read length
         adaptive_scoring.gap_open = std::min<int>(-1, static_cast<int>(-0.01 * query_len - 4));
@@ -155,9 +157,9 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     if (max_alignments < 1) max_alignments = 1;
     if (max_alignments > 4) max_alignments = 4; // Cap at 4 total alignments
 
-    align::Alignment best_swaln;
+    bwa::align::Alignment best_swaln;
     int32_t best_chain_idx = -1;
-    std::vector<std::pair<int32_t, align::Alignment>> all_alignments;
+    std::vector<std::pair<int32_t, bwa::align::Alignment>> all_alignments;
 
     for (int32_t ci = 0; ci < max_alignments && ci < (int32_t)chains.size(); ++ci) {
         const auto& chain = chains[ci];
@@ -172,7 +174,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         auto ref_region = index_.extract_ref(ref_begin, ref_end);
         if (ref_region.empty()) continue;
 
-        align::Alignment sw_aln = align::sw_semi_global_extend(
+        bwa::align::Alignment sw_aln = bwa::align::sw_semi_global_extend(
             adaptive_scoring,
             std::span<const uint8_t>(query_bytes.data(), query_len),
             std::span<const uint8_t>(ref_region.data(), ref_region.size()),
@@ -204,15 +206,15 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
         for (const auto& mem : best_chain.mems) {
             if (mem.query_pos > prev_query_end) {
                 result.primary.cigar.push_back(
-                    align::encode_cigar(mem.query_pos - prev_query_end, align::CigarOp::SoftClip));
+                    bwa::align::encode_cigar(mem.query_pos - prev_query_end, bwa::align::CigarOp::SoftClip));
             }
             result.primary.cigar.push_back(
-                align::encode_cigar(mem.len, align::CigarOp::Match));
+                bwa::align::encode_cigar(mem.len, bwa::align::CigarOp::Match));
             prev_query_end = mem.query_end();
         }
         if (prev_query_end < query_len) {
             result.primary.cigar.push_back(
-                align::encode_cigar(query_len - prev_query_end, align::CigarOp::SoftClip));
+                bwa::align::encode_cigar(query_len - prev_query_end, bwa::align::CigarOp::SoftClip));
         }
         return;
     }
@@ -246,10 +248,10 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     // Add NM and MD tags for primary
     int32_t nm = 0;
     for (uint32_t c : result.primary.cigar) {
-        auto op = static_cast<align::CigarOp>(c & 0xF);
-        int len = align::cigar_len(c);
-        if (op == align::CigarOp::Diff) nm += len;
-        else if (op == align::CigarOp::Ins || op == align::CigarOp::Del) nm += len;
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        int len = bwa::align::cigar_len(c);
+        if (op == bwa::align::CigarOp::Diff) nm += len;
+        else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
     }
     result.primary.tags.push_back({"NM", std::to_string(nm)});
 
@@ -259,12 +261,12 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     int32_t run_len = 0;
     bool first = true;
     for (uint32_t c : result.primary.cigar) {
-        auto op = static_cast<align::CigarOp>(c & 0xF);
-        int len = align::cigar_len(c);
-        if (op == align::CigarOp::Equal) {
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        int len = bwa::align::cigar_len(c);
+        if (op == bwa::align::CigarOp::Equal) {
             run_len += len;
             ref_pos_in_aln += len;
-        } else if (op == align::CigarOp::Diff) {
+        } else if (op == bwa::align::CigarOp::Diff) {
             if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
             else { md += std::to_string(run_len); }
             run_len = 0;
@@ -272,11 +274,11 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
                 if (k > 0) md += "0";
                 if (ref_pos_in_aln < ref_len) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
-                    md += !ref_base.empty() ? index::PackedSequence::decode_base(ref_base[0]) : 'N';
+                    md += !ref_base.empty() ? bwa::index::PackedSequence::decode_base(ref_base[0]) : 'N';
                 } else { md += 'N'; }
                 ref_pos_in_aln++;
             }
-        } else if (op == align::CigarOp::Del) {
+        } else if (op == bwa::align::CigarOp::Del) {
             if (first) { md += std::to_string(ref_pos_in_aln); first = false; }
             else { md += std::to_string(run_len); }
             run_len = 0;
@@ -284,7 +286,7 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
             for (int k = 0; k < len; ++k) {
                 if (ref_pos_in_aln < ref_len) {
                     auto ref_base = index_.extract_ref(ref_pos_in_aln, ref_pos_in_aln + 1);
-                    md += !ref_base.empty() ? index::PackedSequence::decode_base(ref_base[0]) : 'N';
+                    md += !ref_base.empty() ? bwa::index::PackedSequence::decode_base(ref_base[0]) : 'N';
                 } else { md += 'N'; }
                 ref_pos_in_aln++;
             }
@@ -316,8 +318,8 @@ void Aligner::align_impl(const io::SeqRecord& read, AlignmentResult& result) con
     }
 }
 
-void Aligner::align_pair_impl(const io::SeqRecord& read1,
-                              const io::SeqRecord& read2,
+void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
+                              const bwa::io::SeqRecord& read2,
                               AlignmentResult& result) const {
     // Align both reads independently
     AlignmentResult result1, result2;
@@ -379,8 +381,8 @@ void Aligner::align_pair_impl(const io::SeqRecord& read1,
     }
 }
 
-void Aligner::chain_to_alignment(const align::MEMFinder::Chain& chain,
-                                 const io::SeqRecord& read,
+void Aligner::chain_to_alignment(const bwa::align::MEMFinder::Chain& chain,
+                                 const bwa::io::SeqRecord& read,
                                  const RefSequence& ref,
                                  AlnRecord& aln) const {
     aln.cigar.clear();
@@ -394,12 +396,12 @@ void Aligner::chain_to_alignment(const align::MEMFinder::Chain& chain,
         if (mem.query_pos > prev_query_end) {
             int32_t clip_len = mem.query_pos - prev_query_end;
             aln.cigar.push_back(
-                align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+                bwa::align::encode_cigar(clip_len, bwa::align::CigarOp::SoftClip));
         }
 
         // Add the MEM as a match
         aln.cigar.push_back(
-            align::encode_cigar(mem.len, align::CigarOp::Match));
+            bwa::align::encode_cigar(mem.len, bwa::align::CigarOp::Match));
 
         prev_query_end = mem.query_end();
     }
@@ -408,7 +410,7 @@ void Aligner::chain_to_alignment(const align::MEMFinder::Chain& chain,
     if (prev_query_end < query_len) {
         int32_t clip_len = query_len - prev_query_end;
         aln.cigar.push_back(
-            align::encode_cigar(clip_len, align::CigarOp::SoftClip));
+            bwa::align::encode_cigar(clip_len, bwa::align::CigarOp::SoftClip));
     }
 
     aln.score = chain.score;
@@ -606,12 +608,12 @@ std::string compute_md5(const std::string& data) {
 }
 
 void Index::build_impl(const char* fasta_path, const Config& cfg) {
-    io::SeqReader reader(fasta_path);
+    bwa::io::SeqReader reader(fasta_path);
     if (!reader.is_open()) {
         throw std::runtime_error("Failed to open FASTA file");
     }
 
-    io::SeqRecord rec;
+    bwa::io::SeqRecord rec;
     size_t total_len = 0;
 
     auto read_result = reader.read(rec);
@@ -634,13 +636,13 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
             }
 
             // Pack sequence
-            index::PackedSequence seq;
+            bwa::index::PackedSequence seq;
             seq.append(rec.seq.data(), rec.seq.size());
 
             // Store packed reference for later extraction
             packed_refs_.push_back(seq);
 
-            fm_index_.add_sequence(seq, memory::get_tls_arena());
+            fm_index_.add_sequence(seq, bwa::memory::get_tls_arena());
 
             refs_.push_back(std::move(ref));
             total_len += rec.seq.size();
@@ -758,7 +760,7 @@ void Index::load_impl(const char* prefix) {
 
     // Load BWT using memory-mapped file for large genome support
     std::string bwt_path = std::string(prefix) + ".bwt";
-    io::MmapFile bwt_mmap;
+    bwa::io::MmapFile bwt_mmap;
     bwt_mmap.open(bwt_path.c_str());
     if (!bwt_mmap.is_open()) throw std::runtime_error("Cannot open BWT file");
 
@@ -768,10 +770,10 @@ void Index::load_impl(const char* prefix) {
 
     // Create FM index from loaded data (single index for now)
     {
-        index::FMIndex idx;
+        bwa::index::FMIndex idx;
 
         // Set BWT - directly use mmapped data
-        index::PackedSequence bwt;
+        bwa::index::PackedSequence bwt;
         bwt.resize(total_len);
         for (size_t i = 0; i < total_len; ++i) {
             // Unpack the 2-bit values from the uint64_t array
@@ -785,7 +787,7 @@ void Index::load_impl(const char* prefix) {
 
         // Load SA samples
         std::string sa_path = std::string(prefix) + ".sa";
-        io::MmapFile sa_mmap;
+        bwa::io::MmapFile sa_mmap;
         sa_mmap.open(sa_path.c_str());
         if (!sa_mmap.is_open()) throw std::runtime_error("Cannot open SA file");
 
@@ -795,7 +797,7 @@ void Index::load_impl(const char* prefix) {
 
         // Load occ table
         std::string occ_path = std::string(prefix) + ".occ";
-        io::MmapFile occ_mmap;
+        bwa::io::MmapFile occ_mmap;
         occ_mmap.open(occ_path.c_str());
         if (!occ_mmap.is_open()) throw std::runtime_error("Cannot open OCC file");
 
@@ -818,7 +820,7 @@ void Index::load_impl(const char* prefix) {
 
     // Load packed reference
     std::string pac_path = std::string(prefix) + ".pac";
-    io::MmapFile pac_mmap;
+    bwa::io::MmapFile pac_mmap;
     pac_mmap.open(pac_path.c_str());
     if (!pac_mmap.is_open()) {
         // No packed reference - extract_ref will return empty
@@ -841,3 +843,5 @@ void Index::load_impl(const char* prefix) {
         }
     }
 }
+
+} // namespace bwa

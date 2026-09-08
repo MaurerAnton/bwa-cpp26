@@ -1,7 +1,5 @@
 #pragma once
 
-#include <bwa/core/vector.hpp>
-#include <bwa/core/string.hpp>
 #include <algorithm>
 #include <functional>
 #include <cstddef>
@@ -10,6 +8,9 @@
 #include <type_traits>
 #include <concepts>
 #include <execution>
+
+#include <bwa/core/vector.hpp>
+#include <bwa/core/string.hpp>
 
 namespace bwa::core {
 
@@ -209,8 +210,8 @@ void radix_sort_pairs(Key* keys, Value* values, size_t n) {
     detail::radix_sort_pairs(keys, values, n, key_buf, val_buf);
 }
 
-template <detail::UnsignedIntegral Key, typename Value, typename Alloc>
-void radix_sort_pairs(Vector<Key, 0, Alloc>& keys, Vector<Value, 0, Alloc>& values) {
+template <detail::UnsignedIntegral Key, typename Value, typename AllocK, typename AllocV>
+void radix_sort_pairs(Vector<Key, 0, AllocK>& keys, Vector<Value, 0, AllocV>& values) {
     if (keys.size() != values.size()) return;
     radix_sort_pairs(keys.data(), values.data(), keys.size());
 }

@@ -18,7 +18,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # Memory safety hardening
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection=full")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection")
+# -fcf-protection is x86-only; guard by architecture (fails configure on ARM)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|X86|AMD64|amd64")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcf-protection=full")
+endif()
 
 # PMR support
 find_package(Threads REQUIRED)
@@ -41,15 +45,8 @@ else()
     message(WARNING "Abseil not found - using std::unordered_map fallback")
 endif()
 
+enable_testing()
 add_subdirectory(src)
-add_subdirectory(tests)
-add_subdirectory(benchmarks)
 
-# Install
+# Install (library targets are installed from src/CMakeLists.txt)
 install(DIRECTORY include/bwa DESTINATION include)
-install(TARGETS bwa-core bwa-index bwa-align bwa-io bwa-utils
-        EXPORT bwa-targets
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib
-        RUNTIME DESTINATION bin)
-install(EXPORT bwa-targets FILE bwa-config.cmake DESTINATION lib/cmake/bwa)

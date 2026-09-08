@@ -1,6 +1,5 @@
 #pragma once
 
-#include <bwa/core/arena.hpp>
 #include <string_view>
 #include <span>
 #include <charconv>
@@ -13,6 +12,8 @@
 #include <iterator>
 #include <type_traits>
 #include <expected>
+
+#include <bwa/core/arena.hpp>
 
 namespace bwa::core {
 
@@ -469,6 +470,17 @@ public:
         return NPOS;
     }
 
+    [[nodiscard]] size_type rfind(std::string_view sv, size_type pos = NPOS) const noexcept {
+        if (sv.empty()) return std::min(pos, size_);
+        if (sv.size() > size_) return NPOS;
+        size_type last = std::min(pos, size_ - sv.size());
+        for (size_type i = last + 1; i-- > 0;) {
+            if (std::string_view(data() + i, sv.size()) == sv) return i;
+            if (i == 0) break;
+        }
+        return NPOS;
+    }
+
     [[nodiscard]] PmrString substr(size_type pos = 0, size_type len = NPOS) const {
         if (pos > size_) throw std::out_of_range("PmrString::substr");
         size_type rlen = std::min(len, size_ - pos);
@@ -484,6 +496,12 @@ public:
     }
     friend bool operator==(std::string_view lhs, const PmrString& rhs) noexcept {
         return lhs == rhs.view();
+    }
+    friend bool operator==(const PmrString& lhs, const char* rhs) noexcept {
+        return lhs.view() == std::string_view(rhs ? rhs : "");
+    }
+    friend bool operator==(const char* lhs, const PmrString& rhs) noexcept {
+        return std::string_view(lhs ? lhs : "") == rhs.view();
     }
 
     friend auto operator<=>(const PmrString& lhs, const PmrString& rhs) noexcept {

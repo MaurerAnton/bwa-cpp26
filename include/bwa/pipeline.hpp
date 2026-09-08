@@ -22,6 +22,7 @@
 #include <sstream>
 #include <zlib.h>
 #include <bwa/io/bam_io.hpp>
+#include <bwa/io/bai_io.hpp>
 
 namespace bwa {
 
