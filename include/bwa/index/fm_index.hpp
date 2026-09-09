@@ -300,6 +300,58 @@ inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq
     return sa;
 }
 
+// Prefix-doubling suffix sort - O(n log n) via radix-sort passes.
+// Production SA builder: exactly as correct as brute force, far faster
+// (brute force is O(n^2 log n) with O(n) comparisons). Sorts all n+1
+// suffixes INCLUDING the empty suffix (value n, sorts first), using the
+// same codes as brute force: sentinel=0 < N=1 < A=2 < C=3 < G=4 < T=5.
+// Each pass sorts 64-bit combined keys (rank[i]+1)<<32 | (rank[i+k]+1)
+// (0 = past-end, smallest) with a stable radix sort, then re-ranks.
+// Terminates once all ranks are distinct (within ceil(log2(n+1)) passes).
+inline core::Vector<uint32_t> build_suffix_array_doubling(const PackedSequence& seq,
+                                                          memory::Arena& arena) {
+    size_t n = seq.size();
+    size_t m = n + 1;
+
+    core::Vector<uint32_t> rank(&arena), newrank(&arena);
+    core::Vector<uint64_t> keys(&arena), key_buf(&arena);
+    core::Vector<uint32_t> vals(&arena), val_buf(&arena);
+    rank.resize(m);
+    newrank.resize(m);
+    keys.resize(m);
+    key_buf.resize(m);
+    vals.resize(m);
+    val_buf.resize(m);
+
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = seq.get(i);
+        rank[i] = (b == 4) ? 1 : (b + 2);
+        vals[i] = static_cast<uint32_t>(i);
+    }
+    rank[n] = 0;
+    vals[n] = static_cast<uint32_t>(n);
+
+    for (size_t k = 1; k < m; k <<= 1) {
+        for (size_t i = 0; i < m; ++i) {
+            uint32_t r1 = rank[i] + 1;
+            uint32_t r2 = (i + k <= n) ? rank[i + k] + 1 : 0;
+            keys[i] = (static_cast<uint64_t>(r1) << 32) | r2;
+            vals[i] = static_cast<uint32_t>(i);
+        }
+        core::detail::radix_sort_pairs(keys.data(), vals.data(), m, key_buf, val_buf);
+        // keys[] sorted, vals[] carries the SA order; re-rank by key runs
+        newrank[vals[0]] = 0;
+        uint32_t r = 0;
+        for (size_t t = 1; t < m; ++t) {
+            if (keys[t] != keys[t - 1]) ++r;
+            newrank[vals[t]] = r;
+        }
+        rank.swap(newrank);
+        if (r + 1 >= m) break;  // all ranks distinct
+    }
+    return vals;
+}
+
 // FM-index with rank/select support (standard construction with explicit
 // sentinel). Rows = text length + 1; SA includes the empty suffix (value n,
 // always row 0). BWT codes match suffix-sort order: $=0 < A=1 < C=2 < G=3 <
@@ -528,14 +580,14 @@ public:
         size_t n = seq.size();
         size_t nrows = n + 1;
 
-        // SA-IS: O(n) linear-time suffix array construction is currently
-        // disabled: the SA-IS implementation corrupts the heap (out-of-bounds
-        // writes, see SA producing UINT_MAX entries). Use verified brute-force
-        // O(n^2 log n) until SA-IS is fixed. TODO: re-enable with verification.
-        // NOTE: any replacement must sort the sentinel (value n) as smallest
-        // and use the $=0<N.. order documented on build_suffix_array_brute.
+        // SA construction: prefix-doubling O(n log n) is the production
+        // path (exact; differentially tested against brute force). SA-IS
+        // would be O(n) but its implementation corrupts the heap
+        // (out-of-bounds writes, UINT_MAX entries) and stays disabled until
+        // rewritten to the contract in sais.hpp. The validation below keeps
+        // a brute-force fallback for safety.
         // core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
-        core::Vector<uint32_t> sa_core = build_suffix_array_brute(seq, arena);
+        core::Vector<uint32_t> sa_core = build_suffix_array_doubling(seq, arena);
         bool sais_valid = (sa_core.size() == nrows);
         if (sais_valid) {
             for (size_t i = 0; i < nrows; ++i) {

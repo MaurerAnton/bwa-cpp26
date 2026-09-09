@@ -5,6 +5,8 @@
 #include <bwa/core/string.hpp>
 #include <iostream>
 #include <fstream>
+#include <random>
+#include <string>
 
 using namespace bwa;
 using namespace bwa::index;
@@ -92,6 +94,54 @@ int main() {
         nquery.append("NNNN", 4);
         auto [nl, nr] = idx.backward_search(nquery);
         test("FMIndex N query empty", nl >= nr);
+    }
+
+    // Differential: prefix-doubling must match brute force exactly.
+    // Fixed seed => deterministic. Covers empty, N-heavy, and repetitive inputs.
+    {
+        memory::Arena arena(10 * 1024 * 1024);
+        std::mt19937_64 rng(42);
+        const char alpha[5] = {'A', 'C', 'G', 'T', 'N'};
+        int matched = 0;
+        const int iters = 300;
+        for (int it = 0; it < iters; ++it) {
+            size_t len = static_cast<size_t>(rng() % 65);  // 0..64
+            std::string s;
+            s.reserve(len);
+            for (size_t k = 0; k < len; ++k) {
+                s.push_back(alpha[rng() % 5]);
+            }
+            PackedSequence seq;
+            seq.append(s.data(), s.size());
+            auto ref = build_suffix_array_brute(seq, arena);
+            auto got = build_suffix_array_doubling(seq, arena);
+            bool eq = (ref.size() == got.size());
+            for (size_t k = 0; eq && k < ref.size(); ++k) {
+                eq = (ref[k] == got[k]);
+            }
+            if (!eq) {
+                std::cout << "  mismatch on input '" << s << "'\n";
+                break;
+            }
+            ++matched;
+        }
+        test("Doubling matches brute x300", matched == iters);
+
+        // Edges: empty, single N, all-N run
+        {
+            PackedSequence e;
+            auto r = build_suffix_array_doubling(e, arena);
+            test("Doubling empty", r.size() == 1 && r[0] == 0);
+        }
+        {
+            PackedSequence n1;
+            n1.append("NNNNN", 5);
+            auto ref = build_suffix_array_brute(n1, arena);
+            auto got = build_suffix_array_doubling(n1, arena);
+            bool eq = (ref.size() == got.size());
+            for (size_t k = 0; eq && k < ref.size(); ++k) eq = (ref[k] == got[k]);
+            test("Doubling all-N", eq);
+        }
     }
 
     // MultiFMIndex
