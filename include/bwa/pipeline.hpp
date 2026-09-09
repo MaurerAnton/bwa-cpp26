@@ -327,8 +327,34 @@ private:
                             const RefSequence& ref,
                             AlnRecord& aln) const;
 
-    // Compute MAPQ from scores
-    uint8_t compute_mapq(int32_t best, int32_t second_best) const noexcept;
+public:
+    // Input signals for mapping-quality estimation, mirroring the fields of
+    // BWA's mem_alnreg_t used by mem_approx_mapq_se (bwamem.c).
+    struct MapqSignals {
+        int32_t score = 0;       // best alignment score (a->score)
+        int32_t sub = 0;         // best suboptimal alignment score (a->sub), 0 if none
+        int32_t csub = 0;        // best suboptimal chain score (a->csub), 0 if none
+        int32_t sub_n = 0;       // # suboptimal hits (a->sub_n)
+        int32_t seedcov = 0;     // seed coverage of primary (a->seedcov)
+        int32_t query_span = 0;  // aligned query length (a->qe - a->qb)
+        int32_t ref_span = 0;    // aligned ref length (a->re - a->rb)
+        int32_t match = 1;       // match score (opt->a)
+        int32_t mismatch = 4;    // mismatch penalty magnitude (opt->b)
+        int32_t min_seed_len = 19;
+    };
+
+    // Faithful port of BWA's mem_approx_mapq_se(): 6.02-scaled score gap
+    // discounted by alignment length (mapQ_coef_len/fac) and identity, minus
+    // 4.343*log(sub_n+1) per extra hit, clamped to [0, 60]. Public static so
+    // unit tests can pin the model. Deviations from BWA, all documented at
+    // the call sites: frac_rep scaling is skipped (repetitiveness untracked;
+    // sub_n/second-best already depress repeats), and sub_n counts distinct
+    // emitted chains rather than query-overlapping hits.
+    static uint8_t approx_mapq_se(const MapqSignals& s) noexcept;
+
+private:
+    // Query-span union length of a chain's MEMs (seed coverage estimate)
+    static int32_t seed_query_coverage(const align::MEMFinder::Chain& chain);
 };
 
 // High-level pipeline

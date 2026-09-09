@@ -249,6 +249,47 @@ int main() {
         std::remove("/tmp/bwa_test_nref_idx.pac");
     }
 
+    // MAPQ model: faithful port of BWA mem_approx_mapq_se (bwamem.c).
+    // Hand-computed expectations (match=1, mismatch=4):
+    //   unique 20-mer, min_seed 9: 6.02*(20-9) = 66.2 -> cap 60
+    //   unique 20-mer, min_seed 19 (BWA default): 6.02*1 = 6
+    //   tie 20/20: 0; sub>score: 0
+    //   100bp 100-vs-90: tmp=log50/log100=0.8495, 6.02*10*0.7216=43
+    //   same + 1 suboptimal hit: 43-(4.343*log2)=40
+    //   100bp weak 30-vs-9, identity 0.86: 6.02*21*0.7396^2... = 50
+    //   chain-suboptimal dominates sub: 6.02*(20-18) = 12
+    {
+        auto sig = [](int32_t score, int32_t sub, int32_t span, int32_t min_seed = 9,
+                      int32_t sub_n = 0, int32_t csub = 0) {
+            Aligner::MapqSignals s;
+            s.score = score;
+            s.sub = sub;
+            s.csub = csub;
+            s.sub_n = sub_n;
+            s.seedcov = span;
+            s.query_span = span;
+            s.ref_span = span;
+            s.match = 1;
+            s.mismatch = 4;
+            s.min_seed_len = min_seed;
+            return s;
+        };
+        test("MAPQ unique capped", Aligner::approx_mapq_se(sig(20, 0, 20)) == 60);
+        test("MAPQ BWA-default seed", Aligner::approx_mapq_se(sig(20, 0, 20, 19)) == 6);
+        test("MAPQ tie", Aligner::approx_mapq_se(sig(20, 20, 20)) == 0);
+        test("MAPQ sub exceeds", Aligner::approx_mapq_se(sig(10, 15, 20)) == 0);
+        test("MAPQ long near-tie", Aligner::approx_mapq_se(sig(100, 90, 100)) == 43);
+        test("MAPQ sub_n penalty",
+             Aligner::approx_mapq_se(sig(100, 90, 100, 9, 1)) == 40);
+        test("MAPQ weak identity", Aligner::approx_mapq_se(sig(30, 0, 100)) == 50);
+        test("MAPQ csub dominates",
+             Aligner::approx_mapq_se(sig(20, 5, 20, 9, 0, 18)) == 12);
+        // Monotonicity: more suboptimal hits never raise MAPQ
+        uint8_t q0 = Aligner::approx_mapq_se(sig(100, 90, 100, 9, 0));
+        uint8_t q3 = Aligner::approx_mapq_se(sig(100, 90, 100, 9, 3));
+        test("MAPQ monotone sub_n", q3 <= q0);
+    }
+
     std::cout << "\nResults: " << passed << " passed, " << failed << " failed\n";
     return failed ? 1 : 0;
 }

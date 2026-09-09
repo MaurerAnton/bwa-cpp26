@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -211,7 +212,6 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         result.primary.qname = std::string(read.name.view());
         result.primary.rname = bref.name;
         result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
-        result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
         result.primary.score = best_chain.score;
         result.suboptimal_score = suboptimal_score;
         result.primary.seq = std::string(read.seq.view());
@@ -231,6 +231,32 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             result.primary.cigar.push_back(
                 bwa::align::encode_cigar(query_len - prev_query_end, bwa::align::CigarOp::SoftClip));
         }
+        // Aligned spans exclude soft clips (BWA qb/qe convention)
+        int32_t fb_qspan = 0, fb_rspan = 0;
+        for (uint32_t c : result.primary.cigar) {
+            auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+            int len = bwa::align::cigar_len(c);
+            if (op == bwa::align::CigarOp::Match || op == bwa::align::CigarOp::Equal ||
+                op == bwa::align::CigarOp::Diff || op == bwa::align::CigarOp::Ins) {
+                fb_qspan += len;
+            }
+            if (op == bwa::align::CigarOp::Match || op == bwa::align::CigarOp::Equal ||
+                op == bwa::align::CigarOp::Diff || op == bwa::align::CigarOp::Del) {
+                fb_rspan += len;
+            }
+        }
+        MapqSignals fb_ms;
+        fb_ms.score = best_chain.score;
+        fb_ms.sub = result.second_best_score;
+        fb_ms.csub = suboptimal_score;
+        fb_ms.sub_n = chains.size() > 1 ? static_cast<int32_t>(chains.size()) - 1 : 0;
+        fb_ms.seedcov = seed_query_coverage(best_chain);
+        fb_ms.query_span = fb_qspan;
+        fb_ms.ref_span = fb_rspan;
+        fb_ms.match = adaptive_scoring.match;
+        fb_ms.mismatch = -adaptive_scoring.mismatch;
+        fb_ms.min_seed_len = mem_finder_.min_seed_len();
+        result.primary.mapq = approx_mapq_se(fb_ms);
         return;
     }
 
@@ -260,7 +286,18 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     result.primary.qname = std::string(read.name.view());
     result.primary.rname = pref.name;
     result.primary.pos = final_local_begin + 1;
-    result.primary.mapq = compute_mapq(result.best_score, result.second_best_score);
+    MapqSignals ms;
+    ms.score = primary_swaln.score;
+    ms.sub = result.second_best_score;
+    ms.csub = suboptimal_score;
+    ms.sub_n = all_alignments.size() > 1 ? static_cast<int32_t>(all_alignments.size()) - 1 : 0;
+    ms.seedcov = seed_query_coverage(pchain);
+    ms.query_span = primary_swaln.query_end - primary_swaln.query_begin;
+    ms.ref_span = primary_swaln.ref_end - primary_swaln.ref_begin;
+    ms.match = adaptive_scoring.match;
+    ms.mismatch = -adaptive_scoring.mismatch;
+    ms.min_seed_len = mem_finder_.min_seed_len();
+    result.primary.mapq = approx_mapq_se(ms);
     result.primary.score = primary_swaln.score;
     result.primary.seq = std::string(read.seq.view());
     result.primary.qual = std::string(read.qual.view());
@@ -333,7 +370,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         sec.flag = AlnRecord::F_SECONDARY;
         sec.rname = sref.name;
         sec.pos = sec_local_begin + 1;
-        sec.mapq = compute_mapq(result.best_score, sec_swaln.score);
+        // BWA assigns MAPQ 0 to secondary alignments (mem_reg2aln)
+        sec.mapq = 0;
         sec.score = sec_swaln.score;
         sec.seq = std::string(read.seq.view());
         sec.qual = std::string(read.qual.view());
@@ -440,26 +478,62 @@ void Aligner::chain_to_alignment(const bwa::align::MEMFinder::Chain& chain,
     aln.score = chain.score;
 }
 
-uint8_t Aligner::compute_mapq(int32_t best, int32_t second_best) const noexcept {
-    if (best <= 0) return 0;
-
-    // BWA-MEM style MAPQ calculation
-    // Based on score difference and uniqueness
-    if (second_best <= 0) {
-        // Unique alignment
-        return 60;
+uint8_t Aligner::approx_mapq_se(const MapqSignals& s) noexcept {
+    // Port of BWA mem_approx_mapq_se() (bwamem.c). Constants from
+    // mem_opt_init(): MEM_MAPQ_COEF 30.0, MEM_MAPQ_MAX 60, mapQ_coef_len 50,
+    // mapQ_coef_fac log(50); 6.02 = 10*log(4)/log(10), 4.343 = 10/log(10).
+    int sub = (s.sub != 0) ? s.sub : s.min_seed_len * s.match;
+    if (s.csub > sub) sub = s.csub;
+    if (sub >= s.score) return 0;
+    int32_t alen = s.query_span > s.ref_span ? s.query_span : s.ref_span;
+    if (alen <= 0 || s.match <= 0 || s.mismatch < 0) return 0;  // hardening
+    double len = static_cast<double>(alen);
+    double match = static_cast<double>(s.match);
+    double mismatch = static_cast<double>(s.mismatch);
+    double identity = 1.0 - (len * match - s.score) / (match + mismatch) / len;
+    if (s.score == 0) {
+        return 0;
     }
+    int mapq;
+    constexpr double coef_len = 50.0;
+    constexpr double coef_fac = 3.912023005428146;  // log(50)
+    if (coef_len > 0) {
+        double tmp = len < coef_len ? 1.0 : coef_fac / std::log(len);
+        tmp *= identity * identity;
+        mapq = static_cast<int>(6.02 * (s.score - sub) / match * tmp * tmp + .499);
+    } else {
+        if (s.seedcov < 1) return 0;
+        mapq = static_cast<int>(30.0 * (1.0 - static_cast<double>(sub) / s.score) *
+                                std::log(static_cast<double>(s.seedcov)) +
+                                .499);
+        if (identity < 0.95) {
+            mapq = static_cast<int>(mapq * identity * identity + .499);
+        }
+    }
+    if (s.sub_n > 0) {
+        mapq -= static_cast<int>(4.343 * std::log(static_cast<double>(s.sub_n) + 1.0) + .499);
+    }
+    if (mapq > 60) mapq = 60;
+    if (mapq < 0) mapq = 0;
+    return static_cast<uint8_t>(mapq);
+}
 
-    int diff = best - second_best;
-
-    // Scale by score difference
-    if (diff >= best / 2) return 60;      // Very confident
-    if (diff >= best / 3) return 40;      // Confident
-    if (diff >= best / 4) return 30;      // Moderate
-    if (diff >= 10) return 20;            // Low
-    if (diff >= 5) return 10;             // Very low
-
-    return 0;                              // Uncertain
+int32_t Aligner::seed_query_coverage(const align::MEMFinder::Chain& chain) {
+    // Union length of member MEM query spans (members are query-ordered)
+    int32_t total = 0;
+    int32_t cur_end = -1;
+    for (size_t i = 0; i < chain.mems.size(); ++i) {
+        int32_t b = chain.mems[i].query_pos;
+        int32_t e = chain.mems[i].query_end();
+        if (b > cur_end) {
+            total += e - b;
+            cur_end = e;
+        } else if (e > cur_end) {
+            total += e - cur_end;
+            cur_end = e;
+        }
+    }
+    return total;
 }
 
 void Pipeline::write_header(std::ostream& out) const {
