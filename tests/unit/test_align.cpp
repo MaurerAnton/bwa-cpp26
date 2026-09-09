@@ -43,10 +43,9 @@ int main() {
         test("SW global mismatch CIGAR", has_diff);
     }
 
-    // SW local / semi-global smoke
-    // NOTE: sw_semi_global() is currently an alias for global alignment,
-    // so flanking reference bases are penalized. Test the real pipeline path
-    // sw_semi_global_extend() (free ref end gaps) for positivity instead.
+    // SW local / semi-global.
+    // sw_semi_global aligns the query end-to-end with free reference flanks
+    // (unlike sw_global, which penalizes them).
     {
         align::Scoring sc = align::Scoring::bwa_mem_default();
         std::array<uint8_t, 4> q = {0, 1, 2, 3};
@@ -55,6 +54,19 @@ int main() {
         test("SW local positive", a.score > 0);
         align::Alignment b = align::sw_semi_global_extend(sc, q, r, 32);
         test("SW semi-global-extend positive", b.score > 0);
+        // Exact fit: 4 matches at ref offsets [2, 6), flanks free
+        align::Alignment c = align::sw_semi_global(sc, q, r, 0);
+        test("SW semi-global score", c.score == 4);
+        test("SW semi-global span",
+             c.ref_begin == 2 && c.ref_end == 6 && c.query_begin == 0 &&
+             c.query_end == 4);
+        bool all_equal = !c.cigar.empty();
+        for (uint32_t ci : c.cigar) {
+            if (align::cigar_op(ci) != align::CigarOp::Equal) all_equal = false;
+        }
+        test("SW semi-global CIGAR", all_equal);
+        // Banded extension agrees with full semi-global here
+        test("SW semi-global banded agrees", b.score == c.score);
     }
 
     // MEM find + chain smoke (chain threshold lowered: 8bp MEM scores 8 < default 30)

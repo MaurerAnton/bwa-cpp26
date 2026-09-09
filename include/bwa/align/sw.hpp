@@ -128,7 +128,8 @@ Alignment sw_extend(const Scoring& sc,
                     int32_t max_score_drop = 100);
 
 // Semi-global Smith-Waterman: query aligned end-to-end, reference can have overhangs
-// Used for seed extension where we know the read should be fully aligned
+// Used for seed extension where we know the read should be fully aligned.
+// band_width == 0 selects full DP (same convention as sw_global/sw_local).
 Alignment sw_semi_global_extend(const Scoring& sc,
                                 std::span<const uint8_t> query,
                                 std::span<const uint8_t> ref,
@@ -146,7 +147,10 @@ Alignment sw_local(const Scoring& sc,
                    std::span<const uint8_t> ref,
                    int32_t band_width = 0);
 
-// Semi-global: query aligned globally, reference locally (for extension)
+// Semi-global: query aligned globally, reference locally (free end gaps).
+// Same alignment contract as sw_semi_global_extend, honoring the
+// band_width == 0 means full-DP convention; the pipeline's hot path calls
+// the banded extend() directly.
 Alignment sw_semi_global(const Scoring& sc,
                          std::span<const uint8_t> query,
                          std::span<const uint8_t> ref,

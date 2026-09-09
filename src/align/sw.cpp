@@ -48,7 +48,11 @@ Alignment sw_semi_global_extend(const Scoring& sc,
 
     if (qlen == 0 || rlen == 0) return Alignment{};
 
-    int32_t w = std::max(band_width, std::abs(qlen - rlen) + 1);
+    // Band convention (shared with sw_global/sw_local): band_width > 0 gives
+    // a band of that half-width (widened to cover the length difference);
+    // band_width == 0 means full DP.
+    int32_t w = band_width > 0 ? std::max(band_width, std::abs(qlen - rlen) + 1)
+                               : std::max(qlen, rlen);
     int32_t bw = 2 * w + 1;
 
     using DPState = struct { int32_t h, e, f; };
@@ -199,7 +203,9 @@ Alignment sw_semi_global_extend(const Scoring& sc,
     aln.score = best_score;
     aln.query_begin = 0;
     aln.query_end = qlen;
-    aln.ref_begin = best_j - qlen;
+    // Exact reference span from traceback (tj rests where the alignment
+    // starts; the old best_j - qlen assumed no indels)
+    aln.ref_begin = tj;
     aln.ref_end = best_j;
 
     // Count mismatches
@@ -678,7 +684,10 @@ Alignment sw_semi_global(const Scoring& sc,
                          std::span<const uint8_t> query,
                          std::span<const uint8_t> ref,
                          int32_t band_width) {
-    return sw_global(sc, query, ref, band_width);
+    // Same contract as sw_semi_global_extend (query end-to-end, reference
+    // flanks free); honors the 0 = full-DP band convention. The pipeline's
+    // hot path uses the banded extend() directly.
+    return sw_semi_global_extend(sc, query, ref, band_width);
 }
 
 // Batch processing
