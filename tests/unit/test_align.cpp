@@ -111,6 +111,57 @@ int main() {
         std::remove(fa_path);
     }
 
+    // N-containing reference: flanking matches must survive the N-run,
+    // and the save/load roundtrip must preserve N-ness (v2 format).
+    {
+        const char* fa_path = "/tmp/bwa_test_nref.fa";
+        const char* idx_prefix = "/tmp/bwa_test_nref_idx";
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrN\nACGTACGTACGTACGTNNNNNNNNGATTACAGATTACA\n";
+        }
+        Index idx = Index::build(fa_path);
+        idx.save(idx_prefix);
+        Index loaded = Index::load(idx_prefix);
+        test("NRef roundtrip refs", loaded.num_references() == 1);
+        Aligner aligner(loaded);
+
+        io::SeqRecord readL, readR, readN;
+        readL.name = "readL";
+        readL.seq = "GTACGTACGTAC";  // left flank, offset 2
+        readL.qual = "IIIIIIIIIIII";
+        readR.name = "readR";
+        readR.seq = "TTACAGATTACA";  // right flank
+        readR.qual = "IIIIIIIIIIII";
+        readN.name = "readN";
+        readN.seq = "NNNNNNNNNNNN";  // pure N: must not map
+        readN.qual = "IIIIIIIIIIII";
+
+        AlignmentResult resL = aligner.align(readL);
+        test("NRef left mapped", resL.mapped);
+        test("NRef left rname", resL.primary.rname == "chrN");
+        // Perfect 12-mer: only a full-match placement scores 12
+        test("NRef left perfect", resL.best_score == 12);
+        test("NRef left pos", resL.primary.pos == 3);
+
+        AlignmentResult resR = aligner.align(readR);
+        test("NRef right mapped", resR.mapped);
+        test("NRef right rname", resR.primary.rname == "chrN");
+        // Unique in right flank (0-based 26) -> 1-based 27
+        test("NRef right perfect", resR.best_score == 12);
+        test("NRef right pos", resR.primary.pos == 27);
+
+        AlignmentResult resN = aligner.align(readN);
+        test("NRef N-read unmapped", !resN.mapped);
+
+        std::remove(fa_path);
+        std::remove("/tmp/bwa_test_nref_idx.meta");
+        std::remove("/tmp/bwa_test_nref_idx.bwt");
+        std::remove("/tmp/bwa_test_nref_idx.sa");
+        std::remove("/tmp/bwa_test_nref_idx.occ");
+        std::remove("/tmp/bwa_test_nref_idx.pac");
+    }
+
     std::cout << "\nResults: " << passed << " passed, " << failed << " failed\n";
     return failed ? 1 : 0;
 }

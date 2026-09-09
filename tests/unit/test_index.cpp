@@ -17,9 +17,7 @@ int main() {
         else { std::cout << "  FAIL: " << name << "\n"; ++failed; }
     };
 
-    // Build small index from sequence (N-free for FM backward search;
-    // N-containing refs exercise packed storage but FM rank/C tables
-    // currently count only ACGT, so search tests use clean sequence)
+    // Build small index from N-free sequence
     {
         memory::Arena arena(10 * 1024 * 1024);
         PackedSequence seq;
@@ -27,7 +25,8 @@ int main() {
 
         FMIndex idx = FMIndex::build(seq, arena);
         test("FMIndex build", idx.size() == 26);
-        test("FMIndex BWT size", idx.bwt_size() == 26);
+        // BWT has n+1 rows (including sentinel row)
+        test("FMIndex BWT size", idx.bwt_size() == 27);
 
         // Test rank
         test("FMIndex rank", idx.rank(0, 10) >= 0);
@@ -50,6 +49,49 @@ int main() {
             auto pos = idx.locate(l);
             test("FMIndex locate", pos.has_value());
         }
+    }
+
+    // N-containing reference: Ns are separators for extension, but exact
+    // ACGT matches are found wherever they occur (positions 0,4,12,16);
+    // query Ns never match
+    {
+        memory::Arena arena(10 * 1024 * 1024);
+        PackedSequence seq;
+        seq.append("ACGTACGTNNNNACGTACGT", 20);
+
+        FMIndex idx = FMIndex::build(seq, arena);
+        test("FMIndex N build", idx.size() == 20);
+        // Total counts include sentinel + all 5 symbols
+        test("FMIndex N counts", idx.total(0) + idx.total(1) + idx.total(2) +
+             idx.total(3) + idx.total(4) + idx.total(5) == 21);
+
+        PackedSequence query;
+        query.append("ACGT", 4);
+        auto [l, r] = idx.backward_search(query);
+        test("FMIndex N backward search", l < r);
+        test("FMIndex N count", idx.count(query) == static_cast<size_t>(r - l));
+        // All 4 exact occurrences (neighbors don't matter for exact search)
+        test("FMIndex N count value", r - l == 4);
+        if (l < r) {
+            auto pos = idx.locate(l);
+            test("FMIndex N locate", pos.has_value() && *pos < 20);
+            // Every reported occurrence must really match
+            bool all_match = true;
+            for (size_t p = l; p < r; ++p) {
+                auto q = idx.locate(p);
+                if (!q || *q + 4 > 20) { all_match = false; break; }
+                for (int k = 0; k < 4; ++k) {
+                    if (seq.get(*q + k) != query.get(k)) { all_match = false; break; }
+                }
+                if (!all_match) break;
+            }
+            test("FMIndex N locate correct", all_match && (r - l) == 4);
+        }
+
+        PackedSequence nquery;
+        nquery.append("NNNN", 4);
+        auto [nl, nr] = idx.backward_search(nquery);
+        test("FMIndex N query empty", nl >= nr);
     }
 
     // MultiFMIndex

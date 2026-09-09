@@ -263,72 +263,93 @@ inline int32_t suffix_cmp(const uint8_t* T, int32_t a, int32_t b, int32_t n) noe
 }
 
 // Brute-force suffix sort for testing/verification - O(n^2 log n) but correct
-// Used as a reference implementation and fallback while optimizing
+// Sorts all n+1 suffixes INCLUDING the empty suffix (value n), which sorts
+// first. Any replacement (e.g. SA-IS) must preserve this: row 0 has SA
+// value n, and codes must follow sentinel=0 < N=1 < A=2 < C=3 < G=4 < T=5.
 inline core::Vector<uint32_t> build_suffix_array_brute(const PackedSequence& seq,
                                                         memory::Arena& arena) {
     size_t n = seq.size();
-    if (n == 0) return {};
 
-    // Convert to byte array with sentinel
+    // Convert to byte array with sentinel.
+    // Order: sentinel=0 < N=1 < A=2 < C=3 < G=4 < T=5 (N sorts first so its
+    // rows form one contiguous block; see FMIndex docs).
     core::Vector<uint8_t> T(&arena);
     T.resize(n + 1);
     T[n] = 0;
     for (size_t i = 0; i < n; ++i) {
         uint8_t b = seq.get(i);
-        T[i] = (b == 4) ? 1 : (b + 1);
+        T[i] = (b == 4) ? 1 : (b + 2);
     }
 
-    // Create array of suffix starting positions: 0, 1, ..., n-1
-    // Sentinel at position n is excluded (it would always be smallest)
+    // Suffix starting positions: 0, 1, ..., n (n = empty suffix, smallest)
     core::Vector<uint32_t> sa(&arena);
-    sa.resize(n);
-    for (uint32_t i = 0; i < n; ++i) sa[i] = i;
+    sa.resize(n + 1);
+    for (uint32_t i = 0; i <= n; ++i) sa[i] = i;
 
-    // Sort using std::sort with suffix comparison
+    // Sort by direct comparison over T[0..n]
     std::sort(sa.begin(), sa.end(),
               [T_data = T.data(), n](uint32_t a, uint32_t b) {
                   size_t i = a, j = b;
-                  while (i < n && j < n && T_data[i] == T_data[j]) { ++i; ++j; }
-                  if (i == n && j == n) return a < b;
-                  if (i == n) return true;  // a is shorter
-                  if (j == n) return false; // b is shorter
+                  while (i <= n && j <= n && T_data[i] == T_data[j]) { ++i; ++j; }
+                  if (i > n && j > n) return a < b;
+                  if (i > n) return true;   // a exhausted: smaller
+                  if (j > n) return false;  // b exhausted: smaller
                   return T_data[i] < T_data[j];
               });
 
     return sa;
 }
 
-// FM-index with rank/select support
+// FM-index with rank/select support (standard construction with explicit
+// sentinel). Rows = text length + 1; SA includes the empty suffix (value n,
+// always row 0). BWT codes match suffix-sort order: $=0 < A=1 < C=2 < G=3 <
+// T=4 < N=5. Query/text bases use A=0..N=4 and are mapped +1 at the search
+// boundary; query Ns never match (rejected in backward_search), so reference
+// Ns act as natural separators. LF is exact on every row (single cycle),
+// hence locate() walks need no special cases.
 class FMIndex {
 public:
     using occ_t = uint32_t;
     static constexpr int OCC_INTERVAL = 128; // Rank sampling interval
     static constexpr int SA_INTERVAL = 32;   // SA sampling interval
+    static constexpr int ALPHABET = 6;       // $, A, C, G, T, N
+    static constexpr uint8_t CODE_SENTINEL = 0;
+
+    // Query/text base (A=0..N=4) -> BWT code ($=0, N=1, A=2, C=3, G=4, T=5)
+    [[nodiscard]] static constexpr uint8_t to_code(uint8_t base) noexcept {
+        // base: A=0, C=1, G=2, T=3, N=4
+        // BWT codes: $=0, N=1, A=2, C=3, G=4, T=5
+        return base == 4 ? 1 : static_cast<uint8_t>(base + 2);
+    }
 
 private:
-    PackedSequence bwt_;
-    std::vector<occ_t> occ_;       // Rank table: occ[base][i] = count of base in bwt[0..i*OCC_INTERVAL)
+    std::vector<uint8_t> bwt_;   // BWT sort codes, length_ + 1 cells
+    std::vector<occ_t> occ_;       // Rank table: occ[code][i] = count of code in bwt[0..i*OCC_INTERVAL)
     std::vector<uint32_t> sa_;     // Sampled SA: sa[i] = SA[i * SA_INTERVAL]
-    std::vector<uint32_t> cnt_;    // Cumulative counts: cnt[c] = #bases < c
-    size_t primary_ = 0;      // Position of original string end ($)
-    size_t length_ = 0;       // Original sequence length
+    std::vector<uint32_t> cnt_;    // Cumulative counts: cnt[c] = #codes < c
+    size_t primary_ = 0;      // Row holding the sentinel cell (SA[i] == 0)
+    size_t length_ = 0;       // Text length (rows = length_ + 1)
 
-    // Occurrence array layout: [4][num_intervals]
-    [[nodiscard]] size_t occ_offset(uint8_t base, size_t interval) const noexcept {
-        return interval * 4 + base;
+    // Occurrence array layout: [6][num_intervals]
+    [[nodiscard]] size_t occ_offset(uint8_t code, size_t interval) const noexcept {
+        return interval * ALPHABET + code;
     }
 
     [[nodiscard]] size_t num_intervals() const noexcept {
-        return (length_ + OCC_INTERVAL - 1) / OCC_INTERVAL + 1;
+        return (rows() + OCC_INTERVAL - 1) / OCC_INTERVAL + 1;
     }
 
 public:
+    // Row count (text length + 1 sentinel row). Public: search code must
+    // initialize intervals to [0, rows()), not [0, length()).
+    [[nodiscard]] size_t rows() const noexcept { return length_ + 1; }
+
     FMIndex() = default;
 
     [[nodiscard]] size_t size() const noexcept { return length_; }
     [[nodiscard]] size_t length() const noexcept { return length_; }
     [[nodiscard]] size_t bwt_size() const noexcept { return bwt_.size(); }
-    [[nodiscard]] const PackedSequence& bwt() const noexcept { return bwt_; }
+    [[nodiscard]] const std::vector<uint8_t>& bwt() const noexcept { return bwt_; }
     [[nodiscard]] size_t primary() const noexcept { return primary_; }
 
     // Serialization accessors
@@ -338,59 +359,61 @@ public:
 
     // Setter for deserialization
     void set_size(size_t s) { length_ = s; }
-    void set_bwt(const PackedSequence& bwt) { bwt_ = bwt; }
+    void set_bwt(const std::vector<uint8_t>& bwt) { bwt_ = bwt; }
     void set_primary(size_t p) { primary_ = p; }
     void set_sa_samples(const std::vector<uint32_t>& sa) { sa_ = sa; }
     void set_occ_table(const std::vector<uint32_t>& occ) { occ_ = occ; }
     void set_count_table(const std::vector<uint32_t>& cnt) { cnt_ = cnt; }
 
-    // Rank: number of occurrences of base in bwt[0..pos)
-    [[nodiscard]] uint32_t rank(uint8_t base, size_t pos) const noexcept {
+    // Rank: number of occurrences of code in bwt[0..pos)
+    [[nodiscard]] uint32_t rank(uint8_t code, size_t pos) const noexcept {
         if (pos == 0) return 0;
         size_t interval = pos / OCC_INTERVAL;
         size_t offset = pos % OCC_INTERVAL;
+        (void)offset;
 
-        uint32_t count = occ_[occ_offset(base, interval)];
+        uint32_t count = occ_[occ_offset(code, interval)];
         // Scan remaining
         size_t start = interval * OCC_INTERVAL;
         for (size_t i = start; i < pos; ++i) {
-            if (bwt_.get(i) == base) ++count;
+            if (bwt_[i] == code) ++count;
         }
         return count;
     }
 
-    // C array: cumulative counts
-    [[nodiscard]] uint32_t C(uint8_t base) const noexcept {
-        return cnt_[base];
+    // C array: cumulative counts (code order $ < A < C < G < T < N)
+    [[nodiscard]] uint32_t C(uint8_t code) const noexcept {
+        return cnt_[code];
     }
 
-    // Total count of base
-    [[nodiscard]] uint32_t total(uint8_t base) const noexcept {
-        return cnt_[base + 1] - cnt_[base];
+    // Total count of code
+    [[nodiscard]] uint32_t total(uint8_t code) const noexcept {
+        return cnt_[code + 1] - cnt_[code];
     }
 
     // LF mapping: LF(pos) = C[bwt[pos]] + rank(bwt[pos], pos)
     [[nodiscard]] size_t lf(size_t pos) const noexcept {
-        uint8_t base = bwt_.get(pos);
-        return C(base) + rank(base, pos);
+        uint8_t code = bwt_[pos];
+        return C(code) + rank(code, pos);
     }
 
-    // Backward search: extend interval [l, r) with base
+    // Backward search: extend interval [l, r) with a query base (A=0..T=3)
     // Returns new interval [l', r')
     [[nodiscard]] std::pair<size_t, size_t> backward_extend(uint8_t base,
                                                              size_t l, size_t r) const noexcept {
-        size_t new_l = C(base) + rank(base, l);
-        size_t new_r = C(base) + rank(base, r);
+        uint8_t code = to_code(base);
+        size_t new_l = C(code) + rank(code, l);
+        size_t new_r = C(code) + rank(code, r);
         return {new_l, new_r};
     }
 
     // Backward search for pattern in PackedSequence
     // Returns interval [l, r) in SA, or empty if not found
     [[nodiscard]] std::pair<size_t, size_t> backward_search(const PackedSequence& pat) const noexcept {
-        size_t l = 0, r = length_;
+        size_t l = 0, r = rows();
         for (int32_t i = static_cast<int32_t>(pat.size()) - 1; i >= 0; --i) {
             uint8_t base = pat.get(i);
-            if (base >= 4) return {0, 0}; // N or invalid
+            if (base >= 4) return {0, 0}; // N or invalid never matches
             auto [new_l, new_r] = backward_extend(base, l, r);
             if (new_l >= new_r) return {0, 0}; // Empty
             l = new_l;
@@ -402,10 +425,10 @@ public:
     // Backward search for any pattern with rbegin/rend
     template <typename Pattern>
     [[nodiscard]] std::pair<size_t, size_t> backward_search(const Pattern& pat) const noexcept {
-        size_t l = 0, r = length_;
+        size_t l = 0, r = rows();
         for (auto it = pat.rbegin(); it != pat.rend(); ++it) {
             uint8_t base = PackedSequence::encode_base(*it);
-            if (base >= 4) return {0, 0}; // N or invalid
+            if (base >= 4) return {0, 0}; // N or invalid never matches
             auto [new_l, new_r] = backward_extend(base, l, r);
             if (new_l >= new_r) return {0, 0}; // Empty
             l = new_l;
@@ -414,36 +437,59 @@ public:
         return {l, r};
     }
 
-    // Locate: get SA value at position (requires sampled SA)
-    // We walk forward from the nearest sampled position <= pos using LF.
-    // LF maps position i to the position of the suffix that starts one position
-    // earlier in the original text, so SA[LF(i)] = (SA[i] - 1 + n) % n.
+    // Locate: get SA value at row pos via the sampled SA.
+    // LF maps row i to the row of the suffix starting one position earlier:
+    // SA[LF(i)] = (SA[i]-1+n+1)%(n+1), hence SA[i] = (SA[LF(i)]+1)%(n+1).
+    // Walk LF from pos until a sampled row, counting steps k, then
+    // Locate: get SA value at row pos via the sampled SA.
+    // LF maps row i to the row of the suffix starting one position earlier:
+    // SA[LF(i)] = (SA[i]-1+n+1)%(n+1), hence SA[i] = (SA[LF(i)]+1)%(n+1).
+    // Walk LF from pos until a row with known SA value: an explicitly sampled
+    // text row (SA indices 1, 1+SA_INTERVAL, ...) or row 0, whose SA value is
+    // implicitly n (empty suffix). SA[pos] = (known + steps) % (n+1).
+    // Row 0 itself is rejected (not a text position); search intervals never
+    // contain it since every extension starts at C[code] >= 1.
     [[nodiscard]] std::optional<uint32_t> locate(size_t pos) const noexcept {
-        if (sa_.empty()) return std::nullopt;
-        if (pos >= length_) return std::nullopt;
+        if (sa_.empty() || length_ == 0) return std::nullopt;
+        // Text rows are 1..length_ (row 0 is the empty suffix)
+        if (pos == 0 || pos >= rows()) return std::nullopt;
 
-        // Find the largest sampled position <= pos
-        size_t sampled_pos = (pos / SA_INTERVAL) * SA_INTERVAL;
-        if (sampled_pos > pos) sampled_pos -= SA_INTERVAL;
-
-        // Walk forward from sampled_pos to pos, counting steps
-        size_t steps = pos - sampled_pos;
-        size_t cur = sampled_pos;
-        for (size_t s = 0; s < steps; ++s) {
+        size_t cur = pos;
+        size_t steps = 0;
+        uint32_t base = 0;
+        bool have_base = false;
+        // lf() permutes [0, n+1) in a single cycle: a known row is reached
+        // within n+1 steps; the cap guards against corrupt tables.
+        while (steps <= rows()) {
+            if (cur == 0) {
+                base = static_cast<uint32_t>(length_);  // SA[row 0] = n
+                have_base = true;
+                break;
+            }
+            if ((cur - 1) % SA_INTERVAL == 0) {
+                size_t samp = (cur - 1) / SA_INTERVAL;
+                if (samp >= sa_.size()) return std::nullopt;
+                base = sa_[samp];
+                if (base > length_) return std::nullopt;
+                have_base = true;
+                break;
+            }
             cur = lf(cur);
+            ++steps;
         }
-
-        // Get the SA value at sampled_pos and subtract steps
-        auto base_sa = sa_[sampled_pos / SA_INTERVAL];
-        size_t result = (base_sa + length_ - steps) % length_;
-        return static_cast<uint32_t>(result);
+        if (!have_base) return std::nullopt;
+        uint32_t result = (base + static_cast<uint32_t>(steps)) %
+                          static_cast<uint32_t>(rows());
+        // Text positions are 0..length_-1
+        if (result >= length_) return std::nullopt;
+        return result;
     }
 
     // Locate all positions in range [l, r) - returns vector of SA values
-    // For finding all occurrences of a pattern
+    // For finding all occurrences of a pattern (rows span [0, n+1))
     template <typename OutputIt>
     void locate_range(size_t l, size_t r, OutputIt out) const noexcept {
-        if (sa_.empty() || l >= r || r > length_) return;
+        if (sa_.empty() || l >= r || r > rows()) return;
         for (size_t pos = l; pos < r; ++pos) {
             if (auto sa_val = locate(pos)) {
                 *out++ = *sa_val;
@@ -472,31 +518,34 @@ public:
         return r - l;
     }
 
-    // Build from packed sequence (SA construction)
+    // Build from packed sequence (SA construction, rows = n + 1)
     static FMIndex build(const PackedSequence& seq, memory::Arena& arena) {
         FMIndex idx;
         idx.length_ = seq.size();
-        idx.bwt_.resize(seq.size());
+        idx.bwt_.resize(seq.size() + 1);
 
         // Allocate working memory from arena
         size_t n = seq.size();
+        size_t nrows = n + 1;
 
         // SA-IS: O(n) linear-time suffix array construction is currently
         // disabled: the SA-IS implementation corrupts the heap (out-of-bounds
         // writes, see SA producing UINT_MAX entries). Use verified brute-force
         // O(n^2 log n) until SA-IS is fixed. TODO: re-enable with verification.
+        // NOTE: any replacement must sort the sentinel (value n) as smallest
+        // and use the $=0<N.. order documented on build_suffix_array_brute.
         // core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
         core::Vector<uint32_t> sa_core = build_suffix_array_brute(seq, arena);
-        bool sais_valid = (sa_core.size() == n);
+        bool sais_valid = (sa_core.size() == nrows);
         if (sais_valid) {
-            for (size_t i = 0; i < n; ++i) {
-                if (sa_core[i] >= n) { sais_valid = false; break; }
+            for (size_t i = 0; i < nrows; ++i) {
+                if (sa_core[i] > n) { sais_valid = false; break; }
             }
         }
         // Check permutation (all values distinct)
-        if (sais_valid && n > 0) {
-            std::vector<char> seen(n, 0);
-            for (size_t i = 0; i < n; ++i) {
+        if (sais_valid && nrows > 0) {
+            std::vector<char> seen(nrows, 0);
+            for (size_t i = 0; i < nrows; ++i) {
                 if (seen[sa_core[i]]) { sais_valid = false; break; }
                 seen[sa_core[i]] = 1;
             }
@@ -505,37 +554,46 @@ public:
             sa_core = build_suffix_array_brute(seq, arena);
         }
 
-        // Build BWT from SA
-        for (size_t i = 0; i < n; ++i) {
+        // Build BWT from SA: BWT[i] = text[(SA[i]-1) mod (n+1)] in sort codes
+        // ($=0, N=1, A=2, C=3, G=4, T=5). The row of suffix 0 holds the
+        // sentinel (its predecessor is the empty suffix); the row of the
+        // empty suffix (SA[i]==n) holds text[n-1].
+        for (size_t i = 0; i < nrows; ++i) {
             size_t sa_i = sa_core[i];
-            uint8_t b = (sa_i == 0) ? PackedSequence::ENCODE_N : seq.get(sa_i - 1);
-            idx.bwt_.set(i, b);
+            uint8_t code;
+            if (sa_i == 0) {
+                code = CODE_SENTINEL;
+            } else {
+                uint8_t b = seq.get(sa_i - 1);
+                code = to_code(b);
+            }
+            idx.bwt_[i] = code;
             if (sa_i == 0) idx.primary_ = i;
         }
 
         // Build occ table
         size_t num_intv = idx.num_intervals();
-        idx.occ_.resize(num_intv * 4);
-        idx.cnt_.resize(5); // cnt[0..4], cnt[4] = n
+        idx.occ_.resize(num_intv * ALPHABET);
+        idx.cnt_.resize(ALPHABET + 1); // cnt[0..6], cnt[6] = n + 1
 
-        // Count bases
-        std::array<uint32_t, 4> counts = {0, 0, 0, 0};
-        for (size_t i = 0; i < n; ++i) {
-            uint8_t b = idx.bwt_.get(i);
-            if (b < 4) ++counts[b];
+        // Count codes (all 6 classes)
+        std::array<uint32_t, ALPHABET> counts = {0, 0, 0, 0, 0, 0};
+        for (size_t i = 0; i < nrows; ++i) {
+            uint8_t code = idx.bwt_[i];
+            if (code < ALPHABET) ++counts[code];
 
             if ((i + 1) % OCC_INTERVAL == 0) {
                 size_t intv = (i + 1) / OCC_INTERVAL;
-                for (int b = 0; b < 4; ++b) {
+                for (int b = 0; b < ALPHABET; ++b) {
                     idx.occ_[idx.occ_offset(b, intv)] = counts[b];
                 }
             }
         }
         // Record final interval (for positions past the last exact boundary)
-        if (n % OCC_INTERVAL != 0) {
-            size_t intv = n / OCC_INTERVAL + 1;
+        if (nrows % OCC_INTERVAL != 0) {
+            size_t intv = nrows / OCC_INTERVAL + 1;
             if (intv < num_intv) {
-                for (int b = 0; b < 4; ++b) {
+                for (int b = 0; b < ALPHABET; ++b) {
                     idx.occ_[idx.occ_offset(b, intv)] = counts[b];
                 }
             }
@@ -543,13 +601,15 @@ public:
 
         // Cumulative counts
         idx.cnt_[0] = 0;
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < ALPHABET; ++b) {
             idx.cnt_[b + 1] = idx.cnt_[b] + counts[b];
         }
 
-        // Sample SA
-        idx.sa_.resize((n + SA_INTERVAL - 1) / SA_INTERVAL);
-        for (size_t i = 0; i < n; i += SA_INTERVAL) {
+        // Sample SA at text positions (SA array indices 1, 1+SA_INTERVAL, 1+2*SA_INTERVAL...)
+// These correspond to text positions in suffix array order, excluding sentinel row 0.
+        size_t n_text = nrows - 1;
+        idx.sa_.resize((n_text + SA_INTERVAL - 1) / SA_INTERVAL);
+        for (size_t i = 1; i < nrows; i += SA_INTERVAL) {
             idx.sa_[i / SA_INTERVAL] = sa_core[i];
         }
 

@@ -40,36 +40,6 @@ std::string format_cigar(const std::vector<uint32_t>& cigar) {
     return s;
 }
 
-// Helper: extract a subregion of the packed reference as uint8_t span
-std::vector<uint8_t> extract_ref_region(const bwa::index::FMIndex& fm,
-                                        size_t start, size_t end) {
-    std::vector<uint8_t> result;
-    if (end > fm.length()) end = fm.length();
-    if (start >= end) return result;
-    result.reserve(end - start);
-    for (size_t i = start; i < end; ++i) {
-        // The BWT[i] gives us the character. To get the actual reference
-        // sequence, we need to use the SA. For simplicity, we'll use
-        // backward search to extract a substring.
-        // Actually, for extension, we need the original reference text.
-        // The FMIndex doesn't directly store the original reference.
-        // We can reconstruct it by repeatedly applying LF from the primary.
-        // For now, just get the BWT character.
-        result.push_back(static_cast<uint8_t>(fm.bwt().get(i)));
-    }
-    return result;
-}
-
-// Extract the actual reference sequence at [ref_start, ref_end)
-// by walking through the SA from a sampled position
-std::vector<uint8_t> extract_ref_segment(size_t ref_start, size_t ref_len) {
-    // Placeholder - in a real implementation, we'd use the packed reference
-    // stored alongside the FM-index. For now, we can only return N's.
-    // The actual implementation requires saving the original reference
-    // alongside the index.
-    return std::vector<uint8_t>(ref_len, 0); // A's as placeholder
-}
-
 } // anonymous namespace
 
 void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result) const {
@@ -705,9 +675,10 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
         read_result = reader.read(rec);
     }
 
-    // Build metadata string
+    // Build metadata string (v3: 1-byte BWT codes with sentinel row,
+    // 6-symbol occ tables, N-mask in .pac)
     std::ostringstream oss;
-    oss << "BWA-CPP26-METADATA-v1\n";
+    oss << "BWA-CPP26-METADATA-v3\n";
     oss << refs_.size() << "\n";
     oss << total_len << "\n";
     for (const auto& ref : refs_) {
@@ -728,12 +699,16 @@ void Index::save_impl(const char* prefix) const {
     }
     meta_out.close();
 
-    // Save FM-index (simplified - just BWT for now)
+    // Save BWT: v3 format stores one byte per row (sort codes $=0..N=5),
+    // length+1 rows per reference (sentinel row included). N is a distinct
+    // code, so no mask section is needed. (v2 stored 2-bit words + mask and
+    // v1 dropped the mask entirely.)
     std::string bwt_path = std::string(prefix) + ".bwt";
     std::ofstream bwt_out(bwt_path, std::ios::binary);
     for (const auto& fm : fm_index_) {
-        bwt_out.write(reinterpret_cast<const char*>(fm.bwt().words().data()),
-                      static_cast<std::streamsize>(fm.bwt().words().size() * sizeof(uint64_t)));
+        const auto& bwt_vec = fm.bwt();
+        bwt_out.write(reinterpret_cast<const char*>(bwt_vec.data()),
+                      static_cast<std::streamsize>(bwt_vec.size()));
     }
     bwt_out.close();
 
@@ -755,7 +730,8 @@ void Index::save_impl(const char* prefix) const {
     }
     occ_out.close();
 
-    // Save packed reference (for subsequence extraction)
+    // Save packed reference: data words + N-mask words per reference.
+    // (The mask restore keeps N vs ACGT exact in extract_ref for SW/MD.)
     std::string pac_path = std::string(prefix) + ".pac";
     std::ofstream pac_out(pac_path, std::ios::binary);
     if (!pac_out) {
@@ -764,6 +740,8 @@ void Index::save_impl(const char* prefix) const {
     for (const auto& packed : packed_refs_) {
         pac_out.write(reinterpret_cast<const char*>(packed.words().data()),
                       static_cast<std::streamsize>(packed.words().size() * sizeof(uint64_t)));
+        pac_out.write(reinterpret_cast<const char*>(packed.n_masks().data()),
+                      static_cast<std::streamsize>(packed.n_masks().size() * sizeof(uint64_t)));
     }
     pac_out.close();
 }
@@ -781,8 +759,15 @@ void Index::load_impl(const char* prefix) {
     meta_in.read(meta_.data(), meta_size);
     meta_in.close();
 
-    // Parse metadata
+    // Parse metadata (v3 required: 1-byte BWT codes with sentinel row,
+    // 6-symbol occ tables, N-mask in .pac; older files misload silently,
+    // so refuse them explicitly)
     std::string_view mv = meta_;
+    if (!mv.starts_with("BWA-CPP26-METADATA-v3\n")) {
+        throw std::runtime_error(
+            "Unsupported index version (need v3, found incompatible metadata). "
+            "Rebuild the index with this bwa-cpp26 version.");
+    }
     size_t pos = mv.find('\n') + 1;
     size_t num_refs = 0, total_len = 0;
     sscanf(mv.data() + pos, "%zu\n%zu\n", &num_refs, &total_len);
@@ -819,35 +804,32 @@ void Index::load_impl(const char* prefix) {
     if (!bwt_mmap.is_open()) throw std::runtime_error("Cannot open BWT file");
 
     size_t bwt_size = bwt_mmap.size();
-    const uint64_t* bwt_data = static_cast<const uint64_t*>(bwt_mmap.data());
-    size_t bwt_words = bwt_size / sizeof(uint64_t);
+    const uint8_t* bwt_data = static_cast<const uint8_t*>(bwt_mmap.data());
+    size_t bwt_bytes = bwt_size;
 
     // Reconstruct one FM-index per reference, keeping fm_index_[ri] aligned
-    // with refs_[ri]. save_impl writes each index's BWT/SA/occ arrays
-    // consecutively, so split the blobs using per-ref sizes from metadata.
+    // with refs_[ri]. save_impl writes each index's BWT bytes (length+1 rows
+    // of sort codes), SA and occ arrays consecutively, so split the blobs
+    // using per-ref sizes from metadata.
     // (A single combined index would be invalid: BWT(concat) != concat(BWTs).)
     {
-        size_t bwt_word_off = 0;  // in uint64_t words
+        size_t bwt_byte_off = 0;  // in bytes
         for (size_t ri = 0; ri < num_refs; ++ri) {
             const size_t len = refs_[ri].length;
+            const size_t rows = len + 1;
 
             bwa::index::FMIndex idx;
             idx.set_size(len);
 
-            // BWT slice: (len+31)/32 words of 2-bit bases
-            bwa::index::PackedSequence bwt;
-            bwt.resize(len);
-            for (size_t i = 0; i < len; ++i) {
-                size_t wi = bwt_word_off + i / 32;
-                size_t bi = (i % 32) * 2;
-                uint8_t val = 0;
-                if (wi < bwt_words) {
-                    val = static_cast<uint8_t>((bwt_data[wi] >> bi) & 0x3);
+            // BWT slice: rows bytes of sort codes ($=0..N=5)
+            std::vector<uint8_t> bwt_vec(rows, 0);
+            for (size_t i = 0; i < rows; ++i) {
+                if (bwt_byte_off < bwt_bytes) {
+                    bwt_vec[i] = bwt_data[bwt_byte_off];
                 }
-                bwt.set(i, val);
+                bwt_byte_off++;
             }
-            bwt_word_off += (len + 31) / 32;
-            idx.set_bwt(bwt);
+            idx.set_bwt(bwt_vec);
 
             fm_index_.add_index(std::move(idx));
         }
@@ -864,7 +846,8 @@ void Index::load_impl(const char* prefix) {
         size_t sa_avail = sa_mmap.size() / sizeof(uint32_t);
         size_t off = 0;
         for (size_t ri = 0; ri < num_refs; ++ri) {
-            size_t want = (refs_[ri].length + 31) / 32;
+            // SA has length+1 rows (sentinel included)
+            size_t want = (refs_[ri].length + 1 + 31) / 32;
             size_t have = (off < sa_avail) ? std::min(want, sa_avail - off) : 0;
             fm_index_[ri].set_sa_samples(
                 std::vector<uint32_t>(sa_data + off, sa_data + off + have));
@@ -883,9 +866,10 @@ void Index::load_impl(const char* prefix) {
         size_t occ_avail = occ_mmap.size() / sizeof(uint32_t);
         size_t off = 0;
         for (size_t ri = 0; ri < num_refs; ++ri) {
-            size_t len = refs_[ri].length;
-            size_t num_intv = (len + 128 - 1) / 128 + 1;
-            size_t want = num_intv * 4;
+            // Rows = length+1 (sentinel row included)
+            size_t nrows = refs_[ri].length + 1;
+            size_t num_intv = (nrows + 128 - 1) / 128 + 1;
+            size_t want = num_intv * bwa::index::FMIndex::ALPHABET;
             size_t have = (off < occ_avail) ? std::min(want, occ_avail - off) : 0;
             std::vector<uint32_t> occ(occ_data + off, occ_data + off + have);
             if (occ.size() < want) occ.resize(want, 0);
@@ -893,11 +877,12 @@ void Index::load_impl(const char* prefix) {
             fm_index_[ri].set_occ_table(occ);
 
             // Rebuild count table from this ref's final interval
-            std::vector<uint32_t> cnt(5, 0);
-            size_t last_intv = (len + 128 - 1) / 128;
-            for (int b = 0; b < 4; ++b) {
+            std::vector<uint32_t> cnt(bwa::index::FMIndex::ALPHABET + 1, 0);
+            size_t last_intv = (nrows + 128 - 1) / 128;
+            for (int b = 0; b < bwa::index::FMIndex::ALPHABET; ++b) {
                 cnt[static_cast<size_t>(b) + 1] =
-                    cnt[static_cast<size_t>(b)] + occ[last_intv * 4 + static_cast<size_t>(b)];
+                    cnt[static_cast<size_t>(b)] +
+                    occ[last_intv * bwa::index::FMIndex::ALPHABET + static_cast<size_t>(b)];
             }
             fm_index_[ri].set_count_table(cnt);
         }
@@ -915,12 +900,14 @@ void Index::load_impl(const char* prefix) {
     size_t pac_words = pac_mmap.size() / sizeof(uint64_t);
 
     // Distribute packed data among references. save_impl writes each ref's
-    // whole 2-bit words consecutively, so advance by whole words per ref
-    // (a flat base cursor would drift when a length isn't a multiple of 32).
+    // whole 2-bit words followed by its N-mask words, so advance by whole
+    // words per ref (a flat base cursor would drift when a length isn't a
+    // multiple of 32). Restoring the mask keeps N exact in SW/MD.
     packed_refs_.resize(refs_.size());
     size_t word_off = 0;
     for (size_t i = 0; i < refs_.size(); ++i) {
         packed_refs_[i].resize(refs_[i].length);
+        size_t data_words = (refs_[i].length + 31) / 32;
         for (size_t j = 0; j < refs_[i].length; ++j) {
             size_t wi = word_off + j / 32;
             size_t bi = (j % 32) * 2;
@@ -929,8 +916,12 @@ void Index::load_impl(const char* prefix) {
                 val = static_cast<uint8_t>((pac_data[wi] >> bi) & 0x3);
             }
             packed_refs_[i].set(j, val);
+            size_t mi = word_off + data_words + j / 64;
+            if (mi < pac_words) {
+                packed_refs_[i].set_n(j, ((pac_data[mi] >> (j % 64)) & 1) != 0);
+            }
         }
-        word_off += (refs_[i].length + 31) / 32;
+        word_off += data_words + (refs_[i].length + 63) / 64;
     }
 }
 

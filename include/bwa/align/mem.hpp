@@ -107,8 +107,8 @@ public:
                 }
                 if (has_n) continue;
 
-                // Find exact matches
-                size_t l = 0, r = fm_index_.length();
+                // Find exact matches (full row interval [0, rows()))
+                size_t l = 0, r = fm_index_.rows();
                 for (int k = rescue_k - 1; k >= 0; --k) {
                     auto [nl, nr] = fm_index_.backward_extend(query[i + k], l, r);
                     if (nl >= nr) { l = 0; r = 0; break; }
@@ -157,8 +157,8 @@ public:
             }
             if (has_n) continue;
 
-            // Try exact match first
-            size_t l = 0, r = fm_index_.length();
+            // Try exact match first (full row interval [0, rows()))
+            size_t l = 0, r = fm_index_.rows();
             for (int k = min_seed_len_ - 1; k >= 0; --k) {
                 auto [nl, nr] = fm_index_.backward_extend(query[i + k], l, r);
                 if (nl >= nr) { l = 0; r = 0; break; }
@@ -183,7 +183,7 @@ public:
                     for (uint8_t alt = 0; alt < 4; ++alt) {
                         if (alt == query[i + mm_pos]) continue;
 
-                        l = 0; r = fm_index_.length();
+                        l = 0; r = fm_index_.rows();
                         bool ok = true;
                         for (int k = min_seed_len_ - 1; k >= 0; --k) {
                             uint8_t base = (k == mm_pos) ? alt : query[i + k];
@@ -226,8 +226,8 @@ public:
             while (i >= 0 && query[i] >= 4) --i;
             if (i < 0) break;
 
-            // Extend backward as long as possible
-            int32_t l = 0, r = fm_index_.length();
+            // Extend backward as long as possible (full row interval)
+            int32_t l = 0, r = static_cast<int32_t>(fm_index_.rows());
             int32_t j = i;
             int32_t best_l = l, best_r = r, best_j = j;
 
@@ -477,8 +477,8 @@ private:
             while (i_ >= 0 && query_[static_cast<size_t>(i_)] >= 4) --i_;
             if (i_ < 0) { exhausted_ = true; return; }
 
-            // Extend backward as long as possible
-            int32_t l = 0, r = fm_index_.length();
+            // Extend backward as long as possible (full row interval)
+            int32_t l = 0, r = static_cast<int32_t>(fm_index_.rows());
             int32_t j = i_;
             best_l_ = l; best_j_ = j;
 
