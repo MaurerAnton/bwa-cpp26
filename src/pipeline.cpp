@@ -207,30 +207,15 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         int32_t ref_pos = bmem.ref_pos;
         result.mapped = true;
         result.best_score = best_chain.score;
-        result.best_score = best_chain.score;
         result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
         result.primary.qname = std::string(read.name.view());
         result.primary.rname = bref.name;
         result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
-        result.primary.score = best_chain.score;
         result.suboptimal_score = suboptimal_score;
         result.primary.seq = std::string(read.seq.view());
         result.primary.qual = std::string(read.qual.view());
 
-        int32_t prev_query_end = 0;
-        for (const auto& mem : best_chain.mems) {
-            if (mem.query_pos > prev_query_end) {
-                result.primary.cigar.push_back(
-                    bwa::align::encode_cigar(mem.query_pos - prev_query_end, bwa::align::CigarOp::SoftClip));
-            }
-            result.primary.cigar.push_back(
-                bwa::align::encode_cigar(mem.len, bwa::align::CigarOp::Match));
-            prev_query_end = mem.query_end();
-        }
-        if (prev_query_end < query_len) {
-            result.primary.cigar.push_back(
-                bwa::align::encode_cigar(query_len - prev_query_end, bwa::align::CigarOp::SoftClip));
-        }
+        chain_to_alignment(best_chain, read, bref, result.primary);
         // Aligned spans exclude soft clips (BWA qb/qe convention)
         int32_t fb_qspan = 0, fb_rspan = 0;
         for (uint32_t c : result.primary.cigar) {

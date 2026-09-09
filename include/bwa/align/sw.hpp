@@ -86,36 +86,6 @@ enum class CigarOp : uint8_t {
     return MAP[static_cast<uint8_t>(op)];
 }
 
-// SIMD-accelerated Smith-Waterman (global, local, extension)
-// Replaces ksw.c with std::simd (C++26) or Highway fallback
-namespace detail {
-
-// 16-bit score matrix for SIMD
-using score_t = int16_t;
-// Placeholder for SIMD type - will use std::simd when available
-using simd_score_t = std::array<int16_t, 8>;
-
-// SIMD max for 8 lanes
-inline simd_score_t simd_max_8(simd_score_t a, simd_score_t b) noexcept {
-    simd_score_t r;
-    for (int i = 0; i < 8; ++i) r[i] = (a[i] > b[i]) ? a[i] : b[i];
-    return r;
-}
-
-// Load 8 int16 from memory
-inline simd_score_t simd_load_8(const int16_t* p) noexcept {
-    simd_score_t v;
-    for (int i = 0; i < 8; ++i) v[i] = p[i];
-    return v;
-}
-
-// Store 8 int16 to memory
-inline void simd_store_8(int16_t* p, simd_score_t v) noexcept {
-    for (int i = 0; i < 8; ++i) p[i] = v[i];
-}
-
-} // namespace detail
-
 // Banded Smith-Waterman for alignment extension
 // query: query sequence (packed 2-bit)
 // ref: reference sequence (packed 2-bit)
@@ -156,18 +126,12 @@ Alignment sw_semi_global(const Scoring& sc,
                          std::span<const uint8_t> ref,
                          int32_t band_width = 0);
 
-// Batch alignment for multiple queries
+// Batch alignment for multiple queries (scalar; per-call vectorization is
+// future work once a portable SIMD dependency is available)
 void sw_batch(const Scoring& sc,
               std::span<const std::span<const uint8_t>> queries,
               std::span<const uint8_t> ref,
               std::span<Alignment> results,
               int32_t band_width = 32);
-
-// SIMD-accelerated batch (8 queries at a time)
-void sw_batch_simd(const Scoring& sc,
-                   std::span<const std::span<const uint8_t>> queries,
-                   std::span<const uint8_t> ref,
-                   std::span<Alignment> results,
-                   int32_t band_width = 32);
 
 } // namespace bwa::align

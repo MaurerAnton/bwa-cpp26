@@ -1,26 +1,29 @@
 #!/bin/bash
-# Integration test: Build index and align reads
-set -e
+# Integration test: build index and align reads end to end.
+# Usage: [BWA_CPP26=path/to/bwa] bash tests/integration/test_pipeline.sh
+set -eu
 
-BWA_CPP26=./build_test
+BWA_CPP26="${BWA_CPP26:-./build/src/bwa}"
+if [ ! -x "$BWA_CPP26" ]; then
+    echo "FAIL: bwa binary not found at $BWA_CPP26 (set BWA_CPP26=...)"
+    exit 1
+fi
+
 TEST_DIR=$(mktemp -d)
+trap 'rm -rf "$TEST_DIR"' EXIT
 echo "Test directory: $TEST_DIR"
 
-# Create a small test FASTA (E. coli fragment, ~1KB)
-cat > $TEST_DIR/ref.fa << 'EOF'
+# Small two-region reference: ACGT repeat (1-128) + AACCGGTT repeat (129-256)
+cat > "$TEST_DIR/ref.fa" << 'EOF'
 >test_chr1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
-ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
-ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
-AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT
-AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT
 AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT
 AACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTTAACCGGTT
 EOF
 
-# Create test FASTQ
-cat > $TEST_DIR/reads.fq << 'EOF'
+# Two mappable reads (one per region) + one absent read (no SAM record expected)
+cat > "$TEST_DIR/reads.fq" << 'EOF'
 @read1
 ACGTACGTACGTACGTACGT
 +
@@ -35,36 +38,45 @@ GCTAGCTAGCTAGCTAGCTA
 IIIIIIIIIIIIIIIIIIII
 EOF
 
-# Build index
+fail() { echo "FAIL: $1"; exit 1; }
+
 echo "=== Building index ==="
-$BWA_CPP26 index $TEST_DIR/ref.fa $TEST_DIR/test_idx
+"$BWA_CPP26" index "$TEST_DIR/ref.fa" "$TEST_DIR/test_idx" > /dev/null
 
-# Verify index files exist
 for ext in meta bwt sa occ pac; do
-    if [ ! -f $TEST_DIR/test_idx.$ext ]; then
-        echo "FAIL: Missing index file: test_idx.$ext"
-        exit 1
-    fi
+    [ -f "$TEST_DIR/test_idx.$ext" ] || fail "missing index file test_idx.$ext"
 done
-echo "PASS: All index files created"
+echo "PASS: all index files created"
 
-# Align reads
 echo "=== Aligning reads ==="
-# Run alignment with SAM output to a file (4th arg)
-$BWA_CPP26 mem $TEST_DIR/test_idx $TEST_DIR/reads.fq - $TEST_DIR/aln.sam 2>$TEST_DIR/stderr.txt || true
+"$BWA_CPP26" mem "$TEST_DIR/test_idx" "$TEST_DIR/reads.fq" "$TEST_DIR/aln.sam" \
+    > /dev/null 2> "$TEST_DIR/stderr.txt"
+[ -s "$TEST_DIR/aln.sam" ] || { cat "$TEST_DIR/stderr.txt"; fail "empty SAM output"; }
 
-if [ -s $TEST_DIR/aln.sam ]; then
-    echo "PASS: SAM output generated"
-    echo "Sample output:"
-    cat $TEST_DIR/aln.sam | head -10
-else
-    echo "INFO: SAM output not generated (alignment pipeline not fully implemented yet)"
-    if [ -f $TEST_DIR/stderr.txt ]; then
-        echo "stderr:"
-        cat $TEST_DIR/stderr.txt
-    fi
+grep -q '^@HD' "$TEST_DIR/aln.sam" || fail "missing @HD header"
+grep -q '^@SQ.*SN:test_chr1.*LN:256' "$TEST_DIR/aln.sam" || fail "missing @SQ header"
+
+# read1/read2: mapped to test_chr1, MAPQ 60, perfect 20= CIGAR
+check_mapped() {
+    local line
+    line=$(awk -v q="$1" '$1 == q' "$TEST_DIR/aln.sam")
+    [ -n "$line" ] || fail "$1 has no SAM record"
+    echo "$line" | awk -v q="$1" -v pos="$2" \
+        '$3 == "test_chr1" && $4 == pos && $5 == 60 && $6 == "20=" {
+             exit 0
+         }
+         { print "unexpected record for " q ": " $0 > "/dev/stderr"; exit 1 }' \
+        || fail "$1 mapping incorrect"
+}
+check_mapped read1 45
+echo "PASS: read1 mapped correctly"
+check_mapped read2 169
+echo "PASS: read2 mapped correctly"
+
+# read3 has no match in the reference: must not appear as mapped
+if awk '$1 == "read3" && $3 != "*" && and($2, 4) == 0' "$TEST_DIR/aln.sam" | grep -q .; then
+    fail "read3 unexpectedly mapped"
 fi
+echo "PASS: absent read not mapped"
 
-# Cleanup
-rm -rf $TEST_DIR
 echo "=== Integration test completed ==="

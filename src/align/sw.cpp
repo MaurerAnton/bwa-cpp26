@@ -690,7 +690,7 @@ Alignment sw_semi_global(const Scoring& sc,
     return sw_semi_global_extend(sc, query, ref, band_width);
 }
 
-// Batch processing
+// Batch processing (scalar; see sw.hpp note on vectorization)
 void sw_batch(const Scoring& sc,
               std::span<const std::span<const uint8_t>> queries,
               std::span<const uint8_t> ref,
@@ -699,14 +699,6 @@ void sw_batch(const Scoring& sc,
     for (size_t i = 0; i < queries.size() && i < results.size(); ++i) {
         results[i] = sw_extend(sc, queries[i], ref, 0, 0, band_width);
     }
-}
-
-void sw_batch_simd(const Scoring& sc,
-                   std::span<const std::span<const uint8_t>> queries,
-                   std::span<const uint8_t> ref,
-                   std::span<Alignment> results,
-                   int32_t band_width) {
-    sw_batch(sc, queries, ref, results, band_width);
 }
 
 } // namespace bwa::align
