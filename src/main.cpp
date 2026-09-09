@@ -127,16 +127,19 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Test SA-IS
+        // Test SA-IS (contract: n+1 entries, empty suffix first)
         {
             memory::Arena arena(64 * 1024);
             index::PackedSequence seq;
             seq.append("ACGTAACCGGTTAA", 14);
 
             auto sa = index::detail::sais::build_suffix_array(seq, arena);
+            auto ref = index::build_suffix_array_brute(seq, arena);
 
-            // Verify: SA should have 14 entries
-            if (sa.size() == 14) {
+            // Verify: SA should have 15 entries, match brute force
+            bool eq = (sa.size() == 15) && (ref.size() == sa.size());
+            for (size_t k = 0; eq && k < sa.size(); ++k) eq = (sa[k] == ref[k]);
+            if (eq && sa[0] == 14) {
                 std::cout << "  SA-IS: OK (size=" << sa.size() << ")\n";
             } else {
                 std::cout << "  SA-IS: FAIL (size=" << sa.size() << ")\n";

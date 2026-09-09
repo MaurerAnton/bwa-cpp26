@@ -352,10 +352,22 @@ inline core::Vector<uint32_t> build_suffix_array_doubling(const PackedSequence& 
     return vals;
 }
 
+// Permutation check for a candidate suffix array: nrows entries holding
+// each value in [0, nrows) exactly once. Guards the SA-IS fast path.
+inline bool is_valid_sa(const core::Vector<uint32_t>& sa, size_t nrows) {
+    if (sa.size() != nrows || nrows == 0) return false;
+    std::vector<char> seen(nrows, 0);
+    for (size_t i = 0; i < nrows; ++i) {
+        if (sa[i] >= nrows || seen[sa[i]]) return false;
+        seen[sa[i]] = 1;
+    }
+    return true;
+}
+
 // FM-index with rank/select support (standard construction with explicit
 // sentinel). Rows = text length + 1; SA includes the empty suffix (value n,
-// always row 0). BWT codes match suffix-sort order: $=0 < A=1 < C=2 < G=3 <
-// T=4 < N=5. Query/text bases use A=0..N=4 and are mapped +1 at the search
+// always row 0). BWT codes match suffix-sort order: $=0 < N=1 < A=2 < C=3 <
+// G=4 < T=5. Query/text bases use A=0..N=4 and are mapped at the search
 // boundary; query Ns never match (rejected in backward_search), so reference
 // Ns act as natural separators. LF is exact on every row (single cycle),
 // hence locate() walks need no special cases.
@@ -580,29 +592,14 @@ public:
         size_t n = seq.size();
         size_t nrows = n + 1;
 
-        // SA construction: prefix-doubling O(n log n) is the production
-        // path (exact; differentially tested against brute force). SA-IS
-        // would be O(n) but its implementation corrupts the heap
-        // (out-of-bounds writes, UINT_MAX entries) and stays disabled until
-        // rewritten to the contract in sais.hpp. The validation below keeps
-        // a brute-force fallback for safety.
-        // core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
-        core::Vector<uint32_t> sa_core = build_suffix_array_doubling(seq, arena);
-        bool sais_valid = (sa_core.size() == nrows);
-        if (sais_valid) {
-            for (size_t i = 0; i < nrows; ++i) {
-                if (sa_core[i] > n) { sais_valid = false; break; }
-            }
+        // SA construction: SA-IS O(n) is the production path (rewritten and
+        // differentially tested against brute force). Validation keeps the
+        // prefix-doubling O(n log n) and brute-force fallbacks for safety.
+        core::Vector<uint32_t> sa_core = detail::sais::build_suffix_array(seq, arena);
+        if (!is_valid_sa(sa_core, nrows)) {
+            sa_core = build_suffix_array_doubling(seq, arena);
         }
-        // Check permutation (all values distinct)
-        if (sais_valid && nrows > 0) {
-            std::vector<char> seen(nrows, 0);
-            for (size_t i = 0; i < nrows; ++i) {
-                if (seen[sa_core[i]]) { sais_valid = false; break; }
-                seen[sa_core[i]] = 1;
-            }
-        }
-        if (!sais_valid) {
+        if (!is_valid_sa(sa_core, nrows)) {
             sa_core = build_suffix_array_brute(seq, arena);
         }
 
