@@ -7,6 +7,7 @@
 #include <fstream>
 #include <cstdio>
 #include <array>
+#include <initializer_list>
 
 using namespace bwa;
 
@@ -69,6 +70,80 @@ int main() {
         test("MEM find", mems.size() > 0);
         auto chains = finder.chain(mems, 10000, 5);
         test("MEM chain", chains.size() > 0);
+    }
+
+    // DP-optimal chaining on hand-built MEMs (no FM-index involved).
+    {
+        memory::Arena arena(1024 * 1024);
+        index::PackedSequence ref;
+        ref.append("ACGTACGTACGTACGTACGTACGT", 24);
+        index::FMIndex idx = index::FMIndex::build(ref, arena);
+        align::MEMFinder finder(idx, 4, 500, 1);
+
+        auto make_mem = [](int32_t qp, int32_t rp, int32_t len,
+                           int32_t score, int32_t ref = 0) {
+            align::MEM m;
+            m.query_pos = qp;
+            m.ref_pos = rp;
+            m.ref_id = ref;
+            m.len = len;
+            m.score = score;
+            m.is_forward = true;
+            return m;
+        };
+        auto make_vec = [&](std::initializer_list<align::MEM> ms) {
+            core::Vector<align::MEM> v(&arena);
+            for (const auto& m : ms) v.push_back(m);
+            return v;
+        };
+
+        // 1. Colinear seeds join with gap penalty max(qgap, rgap)
+        {
+            auto mems = make_vec({make_mem(0, 100, 10, 10), make_mem(12, 112, 10, 10)});
+            auto chains = finder.chain(mems, 10000, 5);
+            test("DP colinear count", chains.size() == 1);
+            test("DP colinear score", chains.size() == 1 && chains[0].score == 18);
+            test("DP colinear members", chains.size() == 1 && chains[0].mems.size() == 2);
+            test("DP colinear bounds",
+                 chains.size() == 1 && chains[0].query_begin == 0 &&
+                 chains[0].query_end == 22 && chains[0].ref_begin == 100 &&
+                 chains[0].ref_end == 122 && chains[0].ref_id == 0);
+        }
+
+        // 2. Greedy-failure regression: a far jump must not drag a good
+        // prefix below the threshold (greedy scored -50 and dropped both).
+        {
+            auto mems = make_vec({make_mem(0, 0, 10, 10), make_mem(10, 10, 10, 10),
+                                  make_mem(20, 100, 10, 10)});
+            auto chains = finder.chain(mems, 10000, 5);
+            test("DP rescue count", chains.size() == 2);
+            test("DP rescue best", chains.size() == 2 && chains[0].score == 20 &&
+                 chains[0].mems.size() == 2);
+            test("DP rescue second", chains.size() == 2 && chains[1].score == 10);
+        }
+
+        // 3. Same coordinates on different references stay separate
+        {
+            auto mems = make_vec({make_mem(0, 0, 10, 10, 0), make_mem(0, 0, 10, 10, 1)});
+            auto chains = finder.chain(mems, 10000, 5);
+            test("DP refsplit count", chains.size() == 2);
+            test("DP refsplit ids",
+                 chains.size() == 2 && chains[0].ref_id != chains[1].ref_id);
+        }
+
+        // 4. Query-overlapping seeds do not link (strict colinearity)
+        {
+            auto mems = make_vec({make_mem(0, 0, 10, 10), make_mem(5, 5, 10, 10)});
+            auto chains = finder.chain(mems, 10000, 5);
+            test("DP overlap split", chains.size() == 2);
+        }
+
+        // 5. Empty input, empty output
+        {
+            auto mems = make_vec({});
+            auto chains = finder.chain(mems, 10000, 5);
+            test("DP empty", chains.size() == 0);
+        }
     }
 
     // Multi-reference alignment: reads must map to the correct contig.

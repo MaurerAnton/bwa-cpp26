@@ -336,10 +336,17 @@ public:
         int32_t ref_begin = 0, ref_end = 0;
     };
 
-    // DP-based optimal chaining (BWA-MEM style)
-    // Finds the highest-scoring chain of colinear MEMs.
+    // DP-optimal chaining (BWA-MEM style colinear chaining).
+    // Within each reference, seeds sorted by (query_pos, ref_pos) are linked
+    // by longest-path DP: f[i] = score[i] + max(0, max over predecessors j of
+    // f[j] - gap_cost), with gap_cost = max(query_gap, ref_gap) in match-score
+    // units. A transition j->i requires strict colinearity (non-negative gaps
+    // within max_gap); overlapping seeds are left to filter_overlaps. Chains
+    // are extracted best-first (traceback stops at seeds already emitted) so
+    // chains[0] is the primary candidate and later chains are secondaries.
+    // Returned chains are sorted by score descending. O(n^2) per reference
+    // group; n is the MEM count per read (tens to low hundreds).
     // MEMs are grouped by reference: chains never span references.
-    // Returned chains are sorted by score descending (chains[0] is best).
     core::Vector<Chain> chain(const core::Vector<MEM>& mems,
                         int32_t max_gap = 10000,
                         int32_t min_chain_score = 30) const {
@@ -359,54 +366,118 @@ public:
                       return a.ref_pos < b.ref_pos;
                   });
 
-        int32_t n = static_cast<int32_t>(sorted_mems.size());
-        if (n == 0) return chains;
-
-        // Simple greedy chaining (avoids memory issues with DP)
-        Chain current;
-        current.mems.push_back(sorted_mems[0]);
-        current.score = sorted_mems[0].score;
-        current.ref_id = sorted_mems[0].ref_id;
-        current.query_begin = current.query_end = sorted_mems[0].query_end();
-        current.ref_begin = current.ref_end = sorted_mems[0].ref_end();
-
-        auto flush_current = [&]() {
-            if (current.score >= min_chain_score) {
-                chains.push_back(std::move(current));
+        // DP independently per reference group
+        size_t g_begin = 0;
+        const size_t total = sorted_mems.size();
+        // Scratch buffers reused across groups (sized to largest group)
+        std::vector<int32_t> best;
+        std::vector<int32_t> parent;
+        std::vector<char> used;
+        while (g_begin < total) {
+            size_t g_end = g_begin + 1;
+            const int32_t group_ref = sorted_mems[g_begin].ref_id;
+            while (g_end < total && sorted_mems[g_end].ref_id == group_ref) {
+                ++g_end;
             }
-            current = Chain{};
-        };
-
-        for (int32_t i = 1; i < n; ++i) {
-            const MEM& mem = sorted_mems[i];
-            const MEM& last = current.mems.back();
-
-            int32_t qgap = mem.query_pos - last.query_end();
-            int32_t rgap = mem.ref_pos - last.ref_end();
-
-            if (mem.ref_id == current.ref_id &&
-                qgap >= 0 && rgap >= 0 && qgap <= max_gap && rgap <= max_gap) {
-                current.mems.push_back(mem);
-                current.score += mem.score - std::max(qgap, rgap);
-                current.query_end = mem.query_end();
-                current.ref_end = mem.ref_end();
-            } else {
-                flush_current();
-                current.mems.push_back(mem);
-                current.score = mem.score;
-                current.ref_id = mem.ref_id;
-                current.query_begin = current.query_end = mem.query_end();
-                current.ref_begin = current.ref_end = mem.ref_end();
-            }
+            chain_group(sorted_mems, g_begin, g_end, max_gap, min_chain_score,
+                        best, parent, used, chains);
+            g_begin = g_end;
         }
-
-        flush_current();
 
         // Best chain first (aligner takes chains[0] as primary)
         std::sort(chains.begin(), chains.end(),
                   [](const Chain& a, const Chain& b) { return a.score > b.score; });
 
         return chains;
+    }
+
+    // Longest-path DP over one reference group [g_begin, g_end), appending
+    // best-first chains to `chains`. Scratch vectors are resized as needed.
+    static void chain_group(const std::vector<MEM>& mems,
+                            size_t g_begin, size_t g_end,
+                            int32_t max_gap, int32_t min_chain_score,
+                            std::vector<int32_t>& best,
+                            std::vector<int32_t>& parent,
+                            std::vector<char>& used,
+                            core::Vector<Chain>& chains) {
+        const size_t n = g_end - g_begin;
+        best.assign(n, 0);
+        parent.assign(n, -1);
+        used.assign(n, 0);
+
+        for (size_t ii = 0; ii < n; ++ii) {
+            const MEM& mem = mems[g_begin + ii];
+            int32_t f = mem.score;
+            int32_t p = -1;
+            for (size_t jj = 0; jj < ii; ++jj) {
+                const MEM& prev = mems[g_begin + jj];
+                int32_t qgap = mem.query_pos - prev.query_end();
+                int32_t rgap = mem.ref_pos - prev.ref_end();
+                if (qgap < 0 || rgap < 0 || qgap > max_gap || rgap > max_gap) {
+                    continue;
+                }
+                int32_t gap = qgap > rgap ? qgap : rgap;
+                int32_t cand = best[jj] + mem.score - gap;
+                if (cand > f) {
+                    f = cand;
+                    p = static_cast<int32_t>(jj);
+                }
+            }
+            best[ii] = f;
+            parent[ii] = p;
+        }
+
+        // Best-first extraction: take the highest-scoring unused endpoint,
+        // trace back (stopping at already-emitted seeds), rescore the emitted
+        // prefix from its members, and keep it if it passes the threshold.
+        for (;;) {
+            int32_t top = -1;
+            for (size_t ii = 0; ii < n; ++ii) {
+                if (!used[ii] && (top < 0 || best[ii] > best[static_cast<size_t>(top)])) {
+                    top = static_cast<int32_t>(ii);
+                }
+            }
+            if (top < 0 || best[static_cast<size_t>(top)] < min_chain_score) break;
+
+            // Traceback (indices into mems), oldest seed last in path
+            std::vector<size_t> path;
+            for (int32_t k = top; k >= 0 && !used[static_cast<size_t>(k)];
+                 k = parent[static_cast<size_t>(k)]) {
+                path.push_back(g_begin + static_cast<size_t>(k));
+            }
+            if (path.empty()) break;  // cannot happen: top itself is unused
+            for (size_t pi = 0; pi < path.size(); ++pi) {
+                used[path[pi] - g_begin] = 1;
+            }
+
+            Chain ch;
+            ch.ref_id = mems[path.back()].ref_id;
+            ch.score = 0;
+            bool first = true;
+            int32_t prev_qend = 0, prev_rend = 0;
+            for (size_t pi = path.size(); pi-- > 0;) {
+                const MEM& mem = mems[path[pi]];
+                ch.mems.push_back(mem);
+                if (first) {
+                    ch.score = mem.score;
+                    ch.query_begin = mem.query_pos;
+                    ch.ref_begin = mem.ref_pos;
+                    first = false;
+                } else {
+                    int32_t qgap = mem.query_pos - prev_qend;
+                    int32_t rgap = mem.ref_pos - prev_rend;
+                    int32_t gap = qgap > rgap ? qgap : rgap;
+                    ch.score += mem.score - (gap > 0 ? gap : 0);
+                }
+                prev_qend = mem.query_end();
+                prev_rend = mem.ref_end();
+            }
+            ch.query_end = prev_qend;
+            ch.ref_end = prev_rend;
+            if (ch.score >= min_chain_score && !ch.mems.empty()) {
+                chains.push_back(std::move(ch));
+            }
+        }
     }
 
     // Configuration
