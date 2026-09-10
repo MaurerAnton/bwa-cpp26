@@ -360,12 +360,15 @@ public:
                               const bwa::memory::Arena& arena,
                               AlignmentResult& result) const;
 
-    // Create supplementary alignment from a split read
+    // Create supplementary alignment for a split-read segment. Takes the
+    // oriented CIGAR (hard clips included by the caller), reference name,
+    // 1-based leftmost position, strand and SW score.
     AlnRecord create_supplementary(const io::SeqRecord& read,
-                                   const AlnRecord& primary,
-                                   const bwa::align::Alignment& sw_aln,
-                                   const std::vector<uint8_t>& ref_region,
-                                   int32_t ref_id) const;
+                                   const std::vector<uint32_t>& cigar,
+                                   const std::string& rname,
+                                   int32_t pos_1based,
+                                   bool is_reverse,
+                                   int32_t score) const;
 
     // Compute SA tag entry for a single alignment (RNAME,POS,STRAND,CIGAR,MAPQ,NM;)
     std::string make_sa_tag(const AlnRecord& aln) const;

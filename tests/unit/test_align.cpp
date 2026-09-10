@@ -69,6 +69,44 @@ int main() {
         test("SW semi-global banded agrees", b.score == c.score);
     }
 
+    // SW extension with clipping (BWA ksw_extend contract): a query with an
+    // unalignable prefix/suffix must align only its core and report the
+    // aligned query span, not fail or force end-to-end alignment.
+    {
+        align::Scoring sc = align::Scoring::bwa_mem_default();
+        // R = 21 bases; query = 19 A's + R. A's are absent from R, so the
+        // only positive-scoring alignment is R itself.
+        std::vector<uint8_t> R = {2, 0, 1, 2, 3, 2, 3, 0, 1, 1, 0,
+                                  2, 2, 1, 0, 3, 1, 2, 2, 0, 3};
+        std::vector<uint8_t> Q(19, 0);
+        Q.insert(Q.end(), R.begin(), R.end());
+        auto a = align::sw_semi_global_extend(
+            sc, std::span<const uint8_t>(Q.data(), Q.size()),
+            std::span<const uint8_t>(R.data(), R.size()), 32);
+        test("SW clip score", a.score == 21);
+        test("SW clip query span",
+             a.query_begin == 19 && a.query_end == 40);
+        test("SW clip ref span", a.ref_begin == 0 && a.ref_end == 21);
+        bool has_soft = false;
+        for (uint32_t ci : a.cigar) {
+            if (align::cigar_op(ci) == align::CigarOp::SoftClip) has_soft = true;
+        }
+        test("SW clip CIGAR has S", has_soft);
+
+        // Wide reference window (flanks on both sides) must find the same
+        // core: this regressed when the banded DP was indexed wrongly.
+        std::vector<uint8_t> wide(20, 1);
+        wide.insert(wide.end(), R.begin(), R.end());
+        wide.insert(wide.end(), 20, 3);
+        auto w = align::sw_semi_global_extend(
+            sc, std::span<const uint8_t>(Q.data(), Q.size()),
+            std::span<const uint8_t>(wide.data(), wide.size()), 32);
+        test("SW wide-window score", w.score == 21);
+        test("SW wide-window span",
+             w.query_begin == 19 && w.query_end == 40 && w.ref_begin == 20 &&
+             w.ref_end == 41);
+    }
+
     // MEM find + chain smoke (chain threshold lowered: 8bp MEM scores 8 < default 30)
     {
         memory::Arena arena(1024 * 1024);
@@ -267,6 +305,58 @@ int main() {
              ures2.primary.rname == "*" && ures2.primary.cigar.empty());
         test("Pair-N mate coords",
              ures2.primary.rnext == "chrP" && ures2.primary.pnext == ures1.primary.pos);
+
+        std::remove(fa_path);
+    }
+
+    // Chimeric (split) read: two segments from different references must
+    // produce a soft-clipped primary plus a hard-clipped supplementary with
+    // reciprocal SA:Z tags.
+    {
+        const char* fa_path = "/tmp/bwa_test_chimera.fa";
+        const std::string segA = "AATTACATAACATACACGTC";  // chr1 pos 31
+        const std::string segB = "GCTGTGTCCACCCCATCGGA";  // chr2 pos 31
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrX\n" << std::string(30, 'G') << segA
+               << std::string(30, 'G') << "\n";
+            fa << ">chrY\n" << std::string(30, 'C') << segB
+               << std::string(30, 'C') << "\n";
+        }
+        Index idx = Index::build(fa_path);
+        Aligner aligner(idx);
+
+        io::SeqRecord chim;
+        chim.name = "chim1";
+        chim.seq = segA + segB;
+        chim.qual = std::string(40, 'I');
+
+        AlignmentResult res = aligner.align(chim);
+        test("Chimera mapped", res.mapped);
+        test("Chimera supplementary", res.supplementary.size() == 1);
+        test("Chimera primary clip",
+             res.primary.cigar.size() == 2 &&
+             align::cigar_op(res.primary.cigar.back()) ==
+                 align::CigarOp::SoftClip);
+        if (res.supplementary.size() == 1) {
+            const AlnRecord& supp = res.supplementary[0];
+            test("Chimera supp flag",
+                 (supp.flag & AlnRecord::F_SUPPLEMENTARY) != 0 &&
+                 (supp.flag & AlnRecord::F_SECONDARY) == 0);
+            test("Chimera supp ref", supp.rname != res.primary.rname);
+            test("Chimera supp hard clip",
+                 !supp.cigar.empty() &&
+                 align::cigar_op(supp.cigar.front()) ==
+                     align::CigarOp::HardClip);
+            // Hard-clipped bases are omitted from SEQ.
+            test("Chimera supp seq trimmed", supp.seq.size() == 21);
+            bool p_sa = false, s_sa = false;
+            for (const auto& t : res.primary.tags)
+                if (t.first == "SA:Z") p_sa = true;
+            for (const auto& t : supp.tags)
+                if (t.first == "SA:Z") s_sa = true;
+            test("Chimera SA tags", p_sa && s_sa);
+        }
 
         std::remove(fa_path);
     }

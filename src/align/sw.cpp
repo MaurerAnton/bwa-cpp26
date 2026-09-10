@@ -65,11 +65,12 @@ Alignment sw_semi_global_extend(const Scoring& sc,
     if (dp.size() < dp_size) {
         dp.resize(dp_size);
         trace.resize(dp_size);
-    } else {
-        // Only reset the parts we use
-        std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
-        std::fill_n(trace.data(), dp_size, uint8_t(0));
     }
+    // Always clear the used region: resize() leaves pre-existing elements
+    // (computed under a different band geometry) stale, which polluted later
+    // calls with different query/ref sizes.
+    std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
+    std::fill_n(trace.data(), dp_size, uint8_t(0));
 
     // Precompute index function parameters
     const int32_t w_val = w;
@@ -86,13 +87,15 @@ Alignment sw_semi_global_extend(const Scoring& sc,
         dp[id].f = std::numeric_limits<int32_t>::min() / 2;
     }
 
-    // Initialize first column: must align query from start (penalize gaps)
+    // Initialize first column: free gaps at query start (BWA ksw-style
+    // extension with clipping). Penalizing here forced every alignment to
+    // consume the full query, making 5' soft clips impossible.
     for (int32_t i = 1; i <= qlen && i <= w; ++i) {
         int32_t id = idx(i, 0);
-        dp[id].h = sc.gap_open + sc.gap_ext * i;
-        dp[id].f = dp[id].h;
+        dp[id].h = 0;
+        dp[id].f = std::numeric_limits<int32_t>::min() / 2;
         dp[id].e = std::numeric_limits<int32_t>::min() / 2;
-        trace[id] = 3; // Delete
+        trace[id] = 0; // break: unaligned query prefix becomes soft clip
     }
 
     // Fill DP matrix - use direct index arithmetic for speed
@@ -119,7 +122,12 @@ Alignment sw_semi_global_extend(const Scoring& sc,
             dp[cur_idx].e = e;
             dp[cur_idx].f = f;
 
-            if (h == h_diag) {
+            if (h <= 0) {
+                // Local restart (BWA ksw_extend): the alignment may begin at
+                // any cell, which is what allows clipped query ends.
+                dp[cur_idx].h = 0;
+                trace[cur_idx] = 0;
+            } else if (h == h_diag) {
                 trace[cur_idx] = 1;
             } else if (h == e) {
                 trace[cur_idx] = 2;
@@ -129,15 +137,21 @@ Alignment sw_semi_global_extend(const Scoring& sc,
         }
     }
 
-    // Find best end position: must end at i=qlen (query fully aligned)
-    // Allow any j in the last row
+    // Find best end position anywhere in the banded matrix (BWA ksw-style
+    // extension with clipping): the alignment may end before query end, in
+    // which case the unaligned query suffix becomes a soft clip. Forcing the
+    // end to the last row made suffix clipping impossible, so chimeric reads
+    // (and any read needing a 3' clip) always failed extension.
     int32_t best_score = std::numeric_limits<int32_t>::min() / 2;
-    int32_t best_j = qlen;
-    for (int32_t j = std::max(1, qlen - w); j <= std::min(rlen, qlen + w); ++j) {
-        int32_t id = idx(qlen, j);
-        if (dp[id].h > best_score) {
-            best_score = dp[id].h;
-            best_j = j;
+    int32_t best_i = qlen, best_j = qlen;
+    for (int32_t i = 1; i <= qlen; ++i) {
+        for (int32_t j = std::max(1, i - w); j <= std::min(rlen, i + w); ++j) {
+            int32_t id = idx(i, j);
+            if (dp[id].h > best_score) {
+                best_score = dp[id].h;
+                best_i = i;
+                best_j = j;
+            }
         }
     }
 
@@ -145,7 +159,7 @@ Alignment sw_semi_global_extend(const Scoring& sc,
 
     // Traceback
     Alignment aln;
-    int32_t ti = qlen, tj = best_j;
+    int32_t ti = best_i, tj = best_j;
     int32_t cur_len = 0;
     detail::CigarOp prev_cigar_op = detail::CigarOp::Match;
 
@@ -200,9 +214,15 @@ Alignment sw_semi_global_extend(const Scoring& sc,
     // Reverse CIGAR
     std::reverse(aln.cigar.begin(), aln.cigar.end());
 
+    // Soft clip for unaligned query suffix (extension ended before qlen)
+    if (best_i < qlen) {
+        aln.cigar.push_back(
+            detail::encode_cigar(qlen - best_i, detail::CigarOp::SoftClip));
+    }
+
     aln.score = best_score;
-    aln.query_begin = 0;
-    aln.query_end = qlen;
+    aln.query_begin = ti;
+    aln.query_end = best_i;
     // Exact reference span from traceback (tj rests where the alignment
     // starts; the old best_j - qlen assumed no indels)
     aln.ref_begin = tj;
@@ -250,11 +270,10 @@ Alignment sw_extend(const Scoring& sc,
     if (dp.size() < dp_size) {
         dp.resize(dp_size);
         trace.resize(dp_size);
-    } else {
-        // Only reset the parts we use
-        std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
-        std::fill_n(trace.data(), dp_size, uint8_t(0));
     }
+    // Always clear the used region (see sw_semi_global_extend).
+    std::fill_n(dp.data(), dp_size, DPState{0, 0, 0});
+    std::fill_n(trace.data(), dp_size, uint8_t(0));
 
     // Precompute index function parameters
     const int32_t w_val = w;

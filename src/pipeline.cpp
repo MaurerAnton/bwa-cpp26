@@ -219,7 +219,11 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             effective_config.band_width
         );
 
-        if (sw_aln.score > 0) {
+        // Accept extensions that explain their chain: absolute floor plus
+        // at least half the chain score (BWA drops extensions that keep
+        // little of the seeding evidence; free query start/end clipping
+        // would otherwise promote short spurious matches).
+        if (sw_aln.score >= 10 && sw_aln.score * 2 >= chain.score) {
             all_alignments.push_back({ci, std::move(sw_aln)});
         }
     }
@@ -372,7 +376,14 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     else { md += std::to_string(run_len); }
     result.primary.tags.emplace_back("MD:Z", md);
 
-    // Add secondary alignments (each on its own chain's reference)
+    // Gather alternate alignments (each on its own chain's reference).
+    struct AltAln {
+        size_t alt_idx;  // index into all_alignments
+        int32_t chain_idx;
+        int32_t local_pos;  // 1-based leftmost position on its reference
+        bool rev;
+    };
+    std::vector<AltAln> alts;
     for (size_t i = 1; i < all_alignments.size() && i < 4; ++i) {
         const auto& [sec_chain_idx, sec_swaln] = all_alignments[i];
         const auto& schain = chains[sec_chain_idx];
@@ -381,22 +392,103 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         const auto& sref = index_.references()[static_cast<size_t>(s_ref_id)];
         int32_t sec_local_begin = (s_ref_begin - static_cast<int32_t>(sref.offset)) +
                                   sec_swaln.ref_begin;
+        alts.push_back({i, sec_chain_idx, sec_local_begin + 1,
+                        chain_rev[sec_chain_idx] != 0});
+    }
+
+    // Split-read detection: an alternate whose aligned query span complements
+    // (rather than overlaps) the primary span is a chimeric segment. It is
+    // emitted as a hard-clipped supplementary via create_supplementary
+    // instead of a secondary (BWA mem_reg2sam split logic).
+    int split_alt = -1;
+    {
+        int32_t p_qb = primary_swaln.query_begin, p_qe = primary_swaln.query_end;
+        for (size_t k = 0; k < alts.size(); ++k) {
+            const auto& sw = all_alignments[alts[k].alt_idx].second;
+            int32_t s_qb = sw.query_begin, s_qe = sw.query_end;
+            int32_t overlap =
+                std::max(0, std::min(p_qe, s_qe) - std::max(p_qb, s_qb));
+            // The alternate must cover query territory the primary does not
+            // (left or right extension). Without this, local-SW sub-matches
+            // contained inside the primary span were misclassified as
+            // chimeric segments, flooding output with supplementaries.
+            int32_t ext = std::max(0, p_qb - s_qb) + std::max(0, s_qe - p_qe);
+            int32_t combined = (p_qe - p_qb) + (s_qe - s_qb) - overlap;
+            if (overlap <= std::max(5, query_len / 10) &&
+                ext >= effective_config.min_seed_len &&
+                combined >= query_len * 7 / 10 &&
+                (s_qe - s_qb) >= effective_config.min_seed_len &&
+                sw.score >= config_.min_chain_score) {
+                split_alt = static_cast<int>(k);
+                break;
+            }
+        }
+    }
+
+    for (size_t k = 0; k < alts.size(); ++k) {
+        const auto& alt = alts[k];
+        const auto& [sec_chain_idx, sec_swaln] = all_alignments[alt.alt_idx];
+        const auto& schain = chains[sec_chain_idx];
+        int32_t s_ref_id = 0, s_ref_begin = 0, s_ref_end = 0;
+        if (!chain_ref_window(schain, s_ref_id, s_ref_begin, s_ref_end)) continue;
+        const auto& sref = index_.references()[static_cast<size_t>(s_ref_id)];
+
+        // Oriented CIGAR (reverse strand: mirrored op order).
+        std::vector<uint32_t> oriented = sec_swaln.cigar;
+        if (alt.rev) std::reverse(oriented.begin(), oriented.end());
+
+        if (static_cast<int>(k) == split_alt) {
+            // Strip end clips, then hard-clip the query outside [s_qb, s_qe).
+            int32_t s_qb = sec_swaln.query_begin, s_qe = sec_swaln.query_end;
+            size_t core_b = 0, core_e = oriented.size();
+            auto is_clip = [](uint32_t c) {
+                auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+                return op == bwa::align::CigarOp::SoftClip ||
+                       op == bwa::align::CigarOp::HardClip;
+            };
+            while (core_b < core_e && is_clip(oriented[core_b])) ++core_b;
+            while (core_e > core_b && is_clip(oriented[core_e - 1])) --core_e;
+            if (core_b >= core_e) continue;  // fully clipped: no segment
+            std::vector<uint32_t> hcigar;
+            if (s_qb > 0) {
+                hcigar.push_back(bwa::align::encode_cigar(
+                    s_qb, bwa::align::CigarOp::HardClip));
+            }
+            hcigar.insert(hcigar.end(), oriented.begin() + core_b,
+                          oriented.begin() + core_e);
+            if (s_qe < query_len) {
+                hcigar.push_back(bwa::align::encode_cigar(
+                    query_len - s_qe, bwa::align::CigarOp::HardClip));
+            }
+            AlnRecord supp = create_supplementary(read, hcigar, sref.name,
+                                                  alt.local_pos, alt.rev,
+                                                  sec_swaln.score);
+            // Hard-clipped bases are not stored in SEQ/QUAL (SAM spec).
+            // Query spans are in RC coordinates for reverse segments.
+            int32_t seg_b = alt.rev ? query_len - s_qe : s_qb;
+            int32_t seg_len = s_qe - s_qb;
+            std::string full_seq = std::string(read.seq.view());
+            std::string full_qual = std::string(read.qual.view());
+            supp.seq = full_seq.substr(static_cast<size_t>(seg_b),
+                                       static_cast<size_t>(seg_len));
+            supp.qual = full_qual.substr(static_cast<size_t>(seg_b),
+                                         static_cast<size_t>(seg_len));
+            result.supplementary.push_back(std::move(supp));
+            continue;
+        }
 
         AlnRecord sec;
         sec.qname = std::string(read.name.view());
         sec.flag = AlnRecord::F_SECONDARY;
         sec.rname = sref.name;
-        sec.pos = sec_local_begin + 1;
+        sec.pos = alt.local_pos;
         // BWA assigns MAPQ 0 to secondary alignments (mem_reg2aln)
         sec.mapq = 0;
         sec.score = sec_swaln.score;
         sec.seq = std::string(read.seq.view());
         sec.qual = std::string(read.qual.view());
-        sec.cigar = sec_swaln.cigar;
-        if (chain_rev[sec_chain_idx]) {
-            sec.flag |= AlnRecord::F_REVERSE;
-            std::reverse(sec.cigar.begin(), sec.cigar.end());
-        }
+        sec.cigar = std::move(oriented);
+        if (alt.rev) sec.flag |= AlnRecord::F_REVERSE;
         int32_t sec_nm = 0;
         for (uint32_t c : sec.cigar) {
             auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
@@ -727,7 +819,8 @@ void Aligner::detect_supplementary(const io::SeqRecord& read,
     (void)chains;
     (void)arena;
     if (!config_.output_supplementary) return;
-    if (!result.mapped || result.secondary.empty()) return;
+    if (!result.mapped) return;
+    if (result.secondary.empty() && result.supplementary.empty()) return;
 
     // Move secondaries on a different reference than primary to supplementary.
     std::vector<AlnRecord> kept_secondary;
@@ -754,9 +847,12 @@ void Aligner::detect_supplementary(const io::SeqRecord& read,
     result.secondary = std::move(kept_secondary);
     if (result.supplementary.empty()) return;
 
-    // Build SA:Z tags: primary lists all supplementaries, each supplementary
-    // lists primary + other supplementaries. Format per entry:
+    // Build SA:Z tags once: primary lists all supplementaries, each
+    // supplementary lists primary + other supplementaries. Format per entry:
     // RNAME,POS,STRAND,CIGAR,MAPQ,NM;
+    for (const auto& t : result.primary.tags) {
+        if (t.first == "SA:Z") return;  // already tagged
+    }
     auto entry = [this](const AlnRecord& a) { return make_sa_tag(a); };
     std::string primary_sa;
     for (const auto& supp : result.supplementary) primary_sa += entry(supp);
@@ -773,28 +869,28 @@ void Aligner::detect_supplementary(const io::SeqRecord& read,
     }
 }
 
-// Create supplementary alignment from a split read
+// Create supplementary alignment for a split-read segment.
 AlnRecord Aligner::create_supplementary(const io::SeqRecord& read,
-                                        const AlnRecord& primary,
-                                        const bwa::align::Alignment& sw_aln,
-                                        const std::vector<uint8_t>& ref_region,
-                                        int32_t ref_id) const {
-    (void)primary;
-    (void)ref_region;
+                                        const std::vector<uint32_t>& cigar,
+                                        const std::string& rname,
+                                        int32_t pos_1based,
+                                        bool is_reverse,
+                                        int32_t score) const {
     AlnRecord supp;
     supp.qname = std::string(read.name.view());
     supp.flag = AlnRecord::F_SUPPLEMENTARY;
-    supp.rname = index_.references()[static_cast<size_t>(ref_id)].name;
-    supp.pos = sw_aln.ref_begin + 1;
-    supp.mapq = 0;  // Supplementary alignments get MAPQ 0
-    supp.cigar = sw_aln.cigar;
+    if (is_reverse) supp.flag |= AlnRecord::F_REVERSE;
+    supp.rname = rname;
+    supp.pos = pos_1based;
+    supp.mapq = 0;  // BWA assigns MAPQ 0 to supplementary alignments
+    supp.cigar = cigar;
     supp.seq = std::string(read.seq.view());
     supp.qual = std::string(read.qual.view());
-    supp.score = sw_aln.score;
+    supp.score = score;
     supp.is_supplementary = true;
     supp.is_primary = false;
 
-    // Add NM tag (typed key so SAM writer emits NM:i:<n>)
+    // NM over aligned ops only (H/S clips excluded by op filter).
     int32_t nm = 0;
     for (uint32_t c : supp.cigar) {
         auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
