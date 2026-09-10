@@ -55,16 +55,47 @@ public:
         return mems;
     }
 
+    // Fraction of query covered by exact MEMs of one strand.
+    static double strand_coverage(const core::Vector<MEM>& mems, bool is_fwd,
+                                  int32_t qlen) {
+        if (qlen <= 0) return 0.0;
+        // n is small (tens of MEMs); copy spans and sort for a union sweep.
+        std::vector<std::pair<int32_t, int32_t>> spans;
+        for (const auto& m : mems) {
+            if (m.is_forward != is_fwd) continue;
+            spans.emplace_back(m.query_pos, m.query_end());
+        }
+        if (spans.empty()) return 0.0;
+        std::sort(spans.begin(), spans.end());
+        int32_t total = 0, cur_end = -1;
+        for (const auto& [b, e] : spans) {
+            if (b > cur_end) {
+                total += e - b;
+                cur_end = e;
+            } else if (e > cur_end) {
+                total += e - cur_end;
+                cur_end = e;
+            }
+        }
+        return static_cast<double>(total) / static_cast<double>(qlen);
+    }
+
     void find(const std::span<const uint8_t>& query,
               core::Vector<MEM>& mems) const {
         mems.clear();
         if (query.empty()) return;
+        int32_t qlen = static_cast<int32_t>(query.size());
 
         // Forward search
         find_strand(query, mems, true);
 
-        // Find inexact seeds (1 mismatch) for positions without exact MEMs
-        find_inexact_seeds(query, mems, true);
+        // Inexact (1-mismatch) seeding is ~1000x the cost of exact search
+        // per position. BWA only reseeds poorly covered regions, so skip it
+        // when exact MEMs already cover most of the query.
+        constexpr double kMinExactCoverage = 0.5;
+        if (strand_coverage(mems, true, qlen) < kMinExactCoverage) {
+            find_inexact_seeds(query, mems, true);
+        }
 
         // Reverse complement search
         core::Vector<uint8_t> rc_query;
@@ -80,8 +111,10 @@ public:
         }
         find_strand(std::span<const uint8_t>(rc_query.data(), rc_query.size()),
                     mems, false);
-        find_inexact_seeds(std::span<const uint8_t>(rc_query.data(), rc_query.size()),
-                           mems, false);
+        if (strand_coverage(mems, false, qlen) < kMinExactCoverage) {
+            find_inexact_seeds(std::span<const uint8_t>(rc_query.data(), rc_query.size()),
+                               mems, false);
+        }
     }
 
     // Rescue scan: find seeds with very short k-mers

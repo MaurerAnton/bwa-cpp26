@@ -52,6 +52,19 @@ inline const char* to_string(IoError e) noexcept {
 class GzFile {
     gzFile gz_ = nullptr;
     bool own_ = true;
+    // Chunk buffer for readline: gzread() per byte costs ~10us of call
+    // overhead, which made multi-MB FASTA parsing take minutes.
+    static constexpr size_t kChunkSize = 65536;
+    char chunk_[kChunkSize]{};
+    size_t chunk_pos_ = 0;
+    size_t chunk_len_ = 0;
+    bool hit_eof_ = false;
+
+    void reset_buffer() noexcept {
+        chunk_pos_ = 0;
+        chunk_len_ = 0;
+        hit_eof_ = false;
+    }
 
 public:
     GzFile() = default;
@@ -62,8 +75,13 @@ public:
     GzFile& operator=(const GzFile&) = delete;
 
     GzFile(GzFile&& other) noexcept : gz_(other.gz_), own_(other.own_) {
+        for (size_t i = 0; i < other.chunk_len_; ++i) chunk_[i] = other.chunk_[i];
+        chunk_pos_ = other.chunk_pos_;
+        chunk_len_ = other.chunk_len_;
+        hit_eof_ = other.hit_eof_;
         other.gz_ = nullptr;
         other.own_ = false;
+        other.reset_buffer();
     }
 
     GzFile& operator=(GzFile&& other) noexcept {
@@ -71,14 +89,20 @@ public:
             close();
             gz_ = other.gz_;
             own_ = other.own_;
+            for (size_t i = 0; i < other.chunk_len_; ++i) chunk_[i] = other.chunk_[i];
+            chunk_pos_ = other.chunk_pos_;
+            chunk_len_ = other.chunk_len_;
+            hit_eof_ = other.hit_eof_;
             other.gz_ = nullptr;
             other.own_ = false;
+            other.reset_buffer();
         }
         return *this;
     }
 
     [[nodiscard]] bool open(const char* path, const char* mode = "rb") noexcept {
         close();
+        reset_buffer();
         gz_ = gzopen(path, mode);
         return gz_ != nullptr;
     }
@@ -88,6 +112,7 @@ public:
             gzclose(gz_);
             gz_ = nullptr;
         }
+        reset_buffer();
     }
 
     [[nodiscard]] bool is_open() const noexcept { return gz_ != nullptr; }
@@ -105,23 +130,37 @@ public:
         return static_cast<size_t>(n);
     }
 
-    // Read line (up to newline or EOF)
+    // Read line (up to newline or EOF), consuming input in 64KB chunks.
     [[nodiscard]] std::expected<size_t, IoError> readline(core::PmrString& buf) noexcept {
         buf.clear();
-        char ch;
         while (true) {
-            auto result = read(&ch, 1);
-            if (!result) {
-                if (buf.empty()) return std::unexpected(result.error());
+            if (chunk_pos_ == chunk_len_) {
+                if (hit_eof_) {
+                    return buf.empty() ? std::unexpected(IoError::Eof)
+                                       : std::expected<size_t, IoError>(buf.size());
+                }
+                if (!gz_) return std::unexpected(IoError::FileNotFound);
+                int n = gzread(gz_, chunk_, static_cast<unsigned>(kChunkSize));
+                if (n < 0) return std::unexpected(IoError::ZlibError);
+                if (n == 0) {
+                    hit_eof_ = true;
+                    continue;
+                }
+                chunk_pos_ = 0;
+                chunk_len_ = static_cast<size_t>(n);
+            }
+            size_t start = chunk_pos_;
+            while (chunk_pos_ < chunk_len_ && chunk_[chunk_pos_] != '\n') ++chunk_pos_;
+            size_t end = chunk_pos_;
+            // Strip a trailing '\r' (also when split across a chunk edge,
+            // since the '\r' is consumed here either way).
+            if (end > start && chunk_[end - 1] == '\r') --end;
+            if (end > start) buf.append(chunk_ + start, end - start);
+            if (chunk_pos_ < chunk_len_) {
+                ++chunk_pos_;  // consume '\n'
                 return buf.size();
             }
-            if (*result == 0) {
-                return buf.empty() ? std::unexpected(IoError::Eof) : std::expected<size_t, IoError>(buf.size());
-            }
-            if (ch == '\n') break;
-            if (ch != '\r') buf.kputc(ch);
         }
-        return buf.size();
     }
 
     // Seek (limited support for gzip)
