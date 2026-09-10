@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <map>
 #include <sstream>
 
 namespace bwa {
@@ -296,7 +297,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         if (op == bwa::align::CigarOp::Diff) nm += len;
         else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
     }
-    result.primary.tags.push_back({"NM", std::to_string(nm)});
+    result.primary.tags.emplace_back("NM:i", std::to_string(nm));
 
     // MD tag (positions are global concatenated coordinates here;
     // the leading number is the match run length, per SAM spec)
@@ -338,7 +339,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     }
     if (first) { md = std::to_string(ref_pos_in_aln - final_ref_begin); }
     else { md += std::to_string(run_len); }
-    result.primary.tags.push_back({"MD", md});
+    result.primary.tags.emplace_back("MD:Z", md);
 
     // Add secondary alignments (each on its own chain's reference)
     for (size_t i = 1; i < all_alignments.size() && i < 4; ++i) {
@@ -361,8 +362,19 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         sec.seq = std::string(read.seq.view());
         sec.qual = std::string(read.qual.view());
         sec.cigar = sec_swaln.cigar;
+        int32_t sec_nm = 0;
+        for (uint32_t c : sec.cigar) {
+            auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+            int len = bwa::align::cigar_len(c);
+            if (op == bwa::align::CigarOp::Diff) sec_nm += len;
+            else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) sec_nm += len;
+        }
+        sec.tags.emplace_back("NM:i", std::to_string(sec_nm));
         result.secondary.push_back(std::move(sec));
     }
+
+    // Promote cross-reference secondaries to supplementary + attach SA:Z tags.
+    detect_supplementary(read, chains, arena, result);
 }
 
 void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
@@ -521,6 +533,121 @@ int32_t Aligner::seed_query_coverage(const align::MEMFinder::Chain& chain) {
     return total;
 }
 
+
+
+// Detect and create supplementary alignments for chimeric reads.
+// Any secondary alignment on a different reference than the primary is a
+// chimeric candidate: move it from secondary to supplementary, flag it
+// F_SUPPLEMENTARY (clearing F_SECONDARY), and attach SA:Z tags linking
+// primary <-> supplementaries (BWA mem_mark_secondary / mem_reg2sam logic).
+void Aligner::detect_supplementary(const io::SeqRecord& read,
+                                   const bwa::core::Vector<bwa::align::MEMFinder::Chain>& chains,
+                                   const bwa::memory::Arena& arena,
+                                   AlignmentResult& result) const {
+    (void)read;
+    (void)chains;
+    (void)arena;
+    if (!config_.output_supplementary) return;
+    if (!result.mapped || result.secondary.empty()) return;
+
+    // Move secondaries on a different reference than primary to supplementary.
+    std::vector<AlnRecord> kept_secondary;
+    kept_secondary.reserve(result.secondary.size());
+    for (auto& sec : result.secondary) {
+        if (sec.flag & AlnRecord::F_UNMAP) {
+            kept_secondary.push_back(std::move(sec));
+            continue;
+        }
+        if (sec.rname != result.primary.rname &&
+            sec.score >= config_.min_chain_score &&
+            result.supplementary.size() < 4) {
+            AlnRecord supp = std::move(sec);
+            supp.is_supplementary = true;
+            supp.is_primary = false;
+            supp.flag |= AlnRecord::F_SUPPLEMENTARY;
+            supp.flag &= ~AlnRecord::F_SECONDARY;  // supplementary, not secondary
+            supp.mapq = 0;  // BWA assigns MAPQ 0 to supplementary
+            result.supplementary.push_back(std::move(supp));
+        } else {
+            kept_secondary.push_back(std::move(sec));
+        }
+    }
+    result.secondary = std::move(kept_secondary);
+    if (result.supplementary.empty()) return;
+
+    // Build SA:Z tags: primary lists all supplementaries, each supplementary
+    // lists primary + other supplementaries. Format per entry:
+    // RNAME,POS,STRAND,CIGAR,MAPQ,NM;
+    auto entry = [this](const AlnRecord& a) { return make_sa_tag(a); };
+    std::string primary_sa;
+    for (const auto& supp : result.supplementary) primary_sa += entry(supp);
+    if (!primary_sa.empty()) {
+        result.primary.tags.emplace_back("SA:Z", primary_sa);
+        for (size_t i = 0; i < result.supplementary.size(); ++i) {
+            std::string sa = entry(result.primary);
+            for (size_t j = 0; j < result.supplementary.size(); ++j) {
+                if (j == i) continue;
+                sa += entry(result.supplementary[j]);
+            }
+            result.supplementary[i].tags.emplace_back("SA:Z", sa);
+        }
+    }
+}
+
+// Create supplementary alignment from a split read
+AlnRecord Aligner::create_supplementary(const io::SeqRecord& read,
+                                        const AlnRecord& primary,
+                                        const bwa::align::Alignment& sw_aln,
+                                        const std::vector<uint8_t>& ref_region,
+                                        int32_t ref_id) const {
+    (void)primary;
+    (void)ref_region;
+    AlnRecord supp;
+    supp.qname = std::string(read.name.view());
+    supp.flag = AlnRecord::F_SUPPLEMENTARY;
+    supp.rname = index_.references()[static_cast<size_t>(ref_id)].name;
+    supp.pos = sw_aln.ref_begin + 1;
+    supp.mapq = 0;  // Supplementary alignments get MAPQ 0
+    supp.cigar = sw_aln.cigar;
+    supp.seq = std::string(read.seq.view());
+    supp.qual = std::string(read.qual.view());
+    supp.score = sw_aln.score;
+    supp.is_supplementary = true;
+    supp.is_primary = false;
+
+    // Add NM tag (typed key so SAM writer emits NM:i:<n>)
+    int32_t nm = 0;
+    for (uint32_t c : supp.cigar) {
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        int len = bwa::align::cigar_len(c);
+        if (op == bwa::align::CigarOp::Diff) nm += len;
+        else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
+    }
+    supp.tags.emplace_back("NM:i", std::to_string(nm));
+
+    return supp;
+}
+
+// Compute single SA:Z entry for an alignment: RNAME,POS,STRAND,CIGAR,MAPQ,NM;
+std::string Aligner::make_sa_tag(const AlnRecord& aln) const {
+    std::string sa;
+    sa += aln.rname + ',';
+    sa += std::to_string(aln.pos) + ',';
+    sa += ((aln.flag & AlnRecord::F_REVERSE) ? "-" : "+");
+    sa += ',';
+    sa += format_cigar(aln.cigar) + ',';
+    sa += std::to_string(static_cast<int>(aln.mapq)) + ',';
+    // NM value: tags use typed keys ("NM:i"); accept legacy "NM" too.
+    for (const auto& tag : aln.tags) {
+        if (tag.first == "NM:i" || tag.first == "NM") {
+            sa += tag.second;
+            break;
+        }
+    }
+    sa += ';';
+    return sa;
+}
+
 void Pipeline::write_header(std::ostream& out) const {
     out << "@HD\tVN:1.6\tSO:coordinate\n";
 
@@ -565,6 +692,13 @@ void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result)
     // Write secondary alignments
     for (const auto& sec : result.secondary) {
         write_sam_record(out, sec);
+    }
+
+    // Write supplementary alignments (already carry SA:Z tags)
+    if (config_.output_supplementary) {
+        for (const auto& supp : result.supplementary) {
+            write_sam_record(out, supp);
+        }
     }
 }
 

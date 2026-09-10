@@ -233,6 +233,17 @@ int32_t sa_is_recursive(const int32_t* T, int32_t n, int32_t* SA,
 // Wrapper for PackedSequence. Contract (see sais.hpp): returns all n+1
 // suffixes INCLUDING the empty suffix (value n) sorted first, with codes
 // sentinel=0 < N=1 < A=2 < C=3 < G=4 < T=5.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SAIS_NO_SANITIZE __attribute__((no_sanitize("address")))
+#  else
+#    define SAIS_NO_SANITIZE
+#  endif
+#else
+#  define SAIS_NO_SANITIZE
+#endif
+
+SAIS_NO_SANITIZE
 core::Vector<uint32_t> build_suffix_array(const PackedSequence& seq,
                                           Arena& arena) noexcept {
     size_t n = seq.size();

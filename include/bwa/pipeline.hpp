@@ -343,6 +343,22 @@ public:
         int32_t min_seed_len = 19;
     };
 
+    // Detect and create supplementary alignments for chimeric reads
+    void detect_supplementary(const io::SeqRecord& read,
+                              const bwa::core::Vector<bwa::align::MEMFinder::Chain>& chains,
+                              const bwa::memory::Arena& arena,
+                              AlignmentResult& result) const;
+
+    // Create supplementary alignment from a split read
+    AlnRecord create_supplementary(const io::SeqRecord& read,
+                                   const AlnRecord& primary,
+                                   const bwa::align::Alignment& sw_aln,
+                                   const std::vector<uint8_t>& ref_region,
+                                   int32_t ref_id) const;
+
+    // Compute SA tag entry for a single alignment (RNAME,POS,STRAND,CIGAR,MAPQ,NM;)
+    std::string make_sa_tag(const AlnRecord& aln) const;
+
     // Faithful port of BWA's mem_approx_mapq_se(): 6.02-scaled score gap
     // discounted by alignment length (mapQ_coef_len/fac) and identity, minus
     // 4.343*log(sub_n+1) per extra hit, clamped to [0, 60]. Public static so

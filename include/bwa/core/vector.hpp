@@ -163,7 +163,7 @@ public:
     }
 
     Vector(Vector&& other) noexcept
-        : alloc_(std::move(other.alloc_))
+        : alloc_(other.alloc_)
         , size_(other.size_)
         , capacity_(other.capacity_) {
         if (other.is_inline()) {
@@ -174,9 +174,8 @@ public:
         }
         other.size_ = 0;
         other.capacity_ = use_inline() ? InlineCapacity : 0;
-        if (other.use_inline()) {
-            other.storage_.heap_ptr = nullptr;
-        }
+        // Nullify source pointer to prevent double-free in source's destructor
+        other.storage_.heap_ptr = nullptr;
     }
 
     Vector(std::initializer_list<T> init, const Allocator& alloc = Allocator())
@@ -218,11 +217,9 @@ public:
             clear();
             deallocate_heap();
 
-            // polymorphic_allocator is not assignable, but is_always_equal is true
+            // Arena allocator is not assignable, but is_always_equal is true
             // when resources are equal. Since we use thread-local arenas, they should match.
-            if constexpr (std::allocator_traits<Allocator>::propagate_on_container_move_assignment::value) {
-                alloc_ = std::move(other.alloc_);
-            }
+            // Don't move the allocator - it's a pointer to a shared arena.
 
             size_ = other.size_;
             capacity_ = other.capacity_;
@@ -235,6 +232,8 @@ public:
 
             other.size_ = 0;
             other.capacity_ = use_inline() ? InlineCapacity : 0;
+            // Nullify source pointer to prevent double-free in source's destructor
+            other.storage_.heap_ptr = nullptr;
         }
         return *this;
     }
