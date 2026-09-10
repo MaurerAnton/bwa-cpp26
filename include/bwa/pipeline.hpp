@@ -468,7 +468,11 @@ public:
     void align_pair_to_bam(const char* fastq1, const char* fastq2,
                            const char* bam_path) const;
 
-    // Parallel alignment using a simple thread pool
+    // Parallel alignment using a bounded chunk pipeline: reads are consumed
+    // in chunks of batch_size, each chunk is aligned by a work-stealing pool
+    // (per-thread Aligner + TLS arena), and per-read SAM strings are
+    // reassembled in read order. Output order is therefore identical to the
+    // serial path. (.gz SAM falls back to the serial path.)
     void align_file_parallel(const char* fastq_path, const char* sam_path, int num_threads) const {
         io::SeqReader reader(fastq_path);
         std::ofstream sam_file;
@@ -477,7 +481,7 @@ public:
         if (std::string_view(sam_path) != "-") {
             std::string_view path(sam_path);
             if (path.size() >= 3 && path.substr(path.size()-3) == ".gz") {
-                // For BGZF, read all first, then compress
+                // For BGZF, buffer all output then compress
                 std::stringstream buffer;
                 write_header(buffer);
                 aligner_.align_stream(reader, [&](const AlignmentResult& result) {
@@ -495,47 +499,123 @@ public:
 
         write_header(*out);
 
-        // Simple parallel: read in main thread, process in worker threads
-        std::mutex out_mutex;
-        std::queue<io::SeqRecord> read_queue;
-        std::atomic<bool> done{false};
+        const size_t chunk_size =
+            std::max<size_t>(static_cast<size_t>(config_.batch_size), 64);
+        std::vector<io::SeqRecord> reads(chunk_size);
+        std::vector<std::string> pieces(chunk_size);
+        const int T = std::max(1, num_threads);
 
-        auto worker = [&]() {
-            Aligner local_aligner(index_, config_);
-            while (true) {
-                io::SeqRecord read;
-                std::lock_guard<std::mutex> lock(out_mutex);
-                if (read_queue.empty()) {
-                    if (done) break;
-                    continue;
+        for (;;) {
+            size_t n = 0;
+            while (n < chunk_size && reader.read(reads[n])) ++n;
+            if (n == 0) break;
+
+            std::atomic<size_t> next{0};
+            auto worker = [&]() {
+                Aligner local_aligner(index_, config_);
+                std::ostringstream os;
+                for (;;) {
+                    size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n) break;
+                    AlignmentResult result = local_aligner.align(reads[i]);
+                    os.str(std::string());
+                    os.clear();
+                    write_alignment(os, result);
+                    pieces[i] = os.str();
+                    memory::reset_tls_arena();
                 }
-                read = std::move(read_queue.front());
-                read_queue.pop();
-                if (read.seq.empty()) break;
+            };
+            std::vector<std::thread> threads;
+            const int nt = static_cast<int>(std::min<size_t>(T, n));
+            for (int t = 0; t < nt; ++t) threads.emplace_back(worker);
+            for (auto& t : threads) t.join();
 
-                AlignmentResult result = local_aligner.align(read);
-                write_alignment(*out, result);
+            for (size_t i = 0; i < n; ++i) {
+                *out << pieces[i];
+                pieces[i].clear();
             }
-        };
-
-        io::SeqRecord read;
-        while (reader.read(read)) {
-            read_queue.push(std::move(read));
-            read.clear();
         }
-        done = true;
 
-        std::vector<std::thread> threads;
-        for (int t = 0; t < num_threads; ++t) {
-            threads.emplace_back(worker);
+        if (sam_file.is_open()) sam_file.close();
+    }
+
+    // Parallel paired-end alignment (same chunked scheme as above).
+    void align_pair_parallel(const char* fastq1, const char* fastq2,
+                             const char* sam_path, int num_threads) const {
+        io::SeqReader r1(fastq1), r2(fastq2);
+        std::ofstream sam_file;
+        std::ostream* out = &std::cout;
+
+        if (std::string_view(sam_path) != "-") {
+            std::string_view path(sam_path);
+            if (path.size() >= 3 && path.substr(path.size()-3) == ".gz") {
+                std::stringstream buffer;
+                write_header(buffer);
+                io::SeqRecord read1, read2;
+                while (r1.read(read1) && r2.read(read2)) {
+                    auto [res1, res2] = aligner_.align_pair(read1, read2);
+                    write_pair(buffer, res1, res2);
+                    memory::reset_tls_arena();
+                }
+                write_gzipped(sam_path, buffer.str());
+                return;
+            }
+            sam_file.open(sam_path, std::ios::binary);
+            if (!sam_file) {
+                throw std::runtime_error("Cannot open SAM output file");
+            }
+            out = &sam_file;
         }
-        for (auto& t : threads) t.join();
+
+        write_header(*out);
+
+        const size_t chunk_size =
+            std::max<size_t>(static_cast<size_t>(config_.batch_size), 64);
+        std::vector<io::SeqRecord> reads1(chunk_size), reads2(chunk_size);
+        std::vector<std::string> pieces(chunk_size);
+        const int T = std::max(1, num_threads);
+
+        for (;;) {
+            size_t n = 0;
+            while (n < chunk_size && r1.read(reads1[n]) && r2.read(reads2[n])) ++n;
+            if (n == 0) break;
+
+            std::atomic<size_t> next{0};
+            auto worker = [&]() {
+                Aligner local_aligner(index_, config_);
+                std::ostringstream os;
+                for (;;) {
+                    size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n) break;
+                    auto [res1, res2] =
+                        local_aligner.align_pair(reads1[i], reads2[i]);
+                    os.str(std::string());
+                    os.clear();
+                    write_pair(os, res1, res2);
+                    pieces[i] = os.str();
+                    memory::reset_tls_arena();
+                }
+            };
+            std::vector<std::thread> threads;
+            const int nt = static_cast<int>(std::min<size_t>(T, n));
+            for (int t = 0; t < nt; ++t) threads.emplace_back(worker);
+            for (auto& t : threads) t.join();
+
+            for (size_t i = 0; i < n; ++i) {
+                *out << pieces[i];
+                pieces[i].clear();
+            }
+        }
 
         if (sam_file.is_open()) sam_file.close();
     }
 
     // Align paired FASTQ files
     void align_pair(const char* fastq1, const char* fastq2, const char* sam_path = "-") const {
+        if (config_.num_threads > 1) {
+            align_pair_parallel(fastq1, fastq2, sam_path, config_.num_threads);
+            return;
+        }
         io::SeqReader r1(fastq1), r2(fastq2);
         std::ofstream sam_file;
         std::ostream* out = &std::cout;
