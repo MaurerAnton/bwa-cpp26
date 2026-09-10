@@ -30,6 +30,21 @@ namespace bwa {
 
 namespace {
 
+// Reverse complement of 2-bit base code (0=A,1=C,2=G,3=T,4+=N)
+inline uint8_t rc_base(uint8_t b) noexcept {
+    return b == 0 ? 3 : b == 1 ? 2 : b == 2 ? 1 : b == 3 ? 0 : 4;
+}
+
+// Strand vote for a chain: true = reverse (majority of MEM score on RC).
+inline bool chain_is_reverse(const bwa::align::MEMFinder::Chain& chain) {
+    int32_t fwd = 0, rev = 0;
+    for (size_t i = 0; i < chain.mems.size(); ++i) {
+        if (chain.mems[i].is_forward) fwd += chain.mems[i].score;
+        else rev += chain.mems[i].score;
+    }
+    return rev > fwd;
+}
+
 // Helper: format SAM CIGAR from encoded cigar vector
 std::string format_cigar(const std::vector<uint32_t>& cigar) {
     std::string s;
@@ -156,11 +171,13 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         return ref_end_out > ref_begin_out;
     };
 
-    // Pack query for SW
+    // Pack query for SW (forward + reverse-complement for reverse chains)
     std::vector<uint8_t> query_bytes(query_len);
+    std::vector<uint8_t> query_rc(query_len);
     auto qbases = query.bases();
     for (int32_t i = 0; i < query_len; ++i) {
         query_bytes[i] = qbases[i];
+        query_rc[query_len - 1 - i] = rc_base(qbases[i]);
     }
 
     // Adaptive scoring based on read length (BWA-MEM style)
@@ -181,6 +198,11 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     int32_t best_chain_idx = -1;
     std::vector<std::pair<int32_t, bwa::align::Alignment>> all_alignments;
 
+    std::vector<char> chain_rev(chains.size(), 0);
+    for (size_t ci = 0; ci < chains.size(); ++ci) {
+        chain_rev[ci] = chain_is_reverse(chains[ci]) ? 1 : 0;
+    }
+
     for (int32_t ci = 0; ci < max_alignments && ci < (int32_t)chains.size(); ++ci) {
         const auto& chain = chains[ci];
         int32_t ref_id = 0, ref_begin = 0, ref_end = 0;
@@ -189,9 +211,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         auto ref_region = index_.extract_ref(ref_begin, ref_end);
         if (ref_region.empty()) continue;
 
+        const uint8_t* qptr = chain_rev[ci] ? query_rc.data() : query_bytes.data();
         bwa::align::Alignment sw_aln = bwa::align::sw_semi_global_extend(
             adaptive_scoring,
-            std::span<const uint8_t>(query_bytes.data(), query_len),
+            std::span<const uint8_t>(qptr, query_len),
             std::span<const uint8_t>(ref_region.data(), ref_region.size()),
             effective_config.band_width
         );
@@ -217,6 +240,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         result.primary.qual = std::string(read.qual.view());
 
         chain_to_alignment(best_chain, read, bref, result.primary);
+        if (chain_is_reverse(best_chain)) {
+            result.primary.flag |= AlnRecord::F_REVERSE;
+            std::reverse(result.primary.cigar.begin(), result.primary.cigar.end());
+        }
         // Aligned spans exclude soft clips (BWA qb/qe convention)
         int32_t fb_qspan = 0, fb_rspan = 0;
         for (uint32_t c : result.primary.cigar) {
@@ -288,6 +315,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     result.primary.seq = std::string(read.seq.view());
     result.primary.qual = std::string(read.qual.view());
     result.primary.cigar = primary_swaln.cigar;
+    if (chain_rev[primary_chain_idx]) {
+        result.primary.flag |= AlnRecord::F_REVERSE;
+        std::reverse(result.primary.cigar.begin(), result.primary.cigar.end());
+    }
 
     // Add NM and MD tags for primary
     int32_t nm = 0;
@@ -362,6 +393,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         sec.seq = std::string(read.seq.view());
         sec.qual = std::string(read.qual.view());
         sec.cigar = sec_swaln.cigar;
+        if (chain_rev[sec_chain_idx]) {
+            sec.flag |= AlnRecord::F_REVERSE;
+            std::reverse(sec.cigar.begin(), sec.cigar.end());
+        }
         int32_t sec_nm = 0;
         for (uint32_t c : sec.cigar) {
             auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
@@ -377,67 +412,211 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     detect_supplementary(read, chains, arena, result);
 }
 
+// 5' reference position of an alignment (1-based POS is leftmost).
+static int32_t five_prime_pos(const AlnRecord& a, int32_t ref_span) {
+    bool rev = (a.flag & AlnRecord::F_REVERSE) != 0;
+    return rev ? a.pos + ref_span - 1 : a.pos;
+}
+
+// Reference span (aligned ref length) from CIGAR, excluding clips.
+static int32_t cigar_ref_span(const std::vector<uint32_t>& cigar) {
+    int32_t span = 0;
+    for (uint32_t c : cigar) {
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        int len = bwa::align::cigar_len(c);
+        if (op == bwa::align::CigarOp::Match || op == bwa::align::CigarOp::Equal ||
+            op == bwa::align::CigarOp::Diff || op == bwa::align::CigarOp::Del) {
+            span += len;
+        }
+    }
+    return span;
+}
+
+bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
+                         AlignmentResult& result) const {
+    result.clear();
+    int32_t qlen = static_cast<int32_t>(read.seq.size());
+    if (qlen == 0) return false;
+
+    // Locate mate in global concatenated coordinates.
+    const RefSequence* mref = nullptr;
+    for (size_t i = 0; i < index_.num_references(); ++i) {
+        if (index_.references()[i].name == mate.rname) {
+            mref = &index_.references()[i];
+            break;
+        }
+    }
+    if (mref == nullptr) return false;
+    int32_t mate_global = static_cast<int32_t>(mref->offset) + (mate.pos - 1);
+
+    // Search window around the mate (BWA infers this from the insert-size
+    // distribution; we use a fixed window — documented deviation).
+    constexpr int32_t kRescueWindow = 2000;
+    int32_t w_begin = std::max<int32_t>(static_cast<int32_t>(mref->offset),
+                                        mate_global - kRescueWindow);
+    int32_t w_end = std::min<int32_t>(static_cast<int32_t>(mref->offset + mref->length),
+                                      mate_global + kRescueWindow + qlen);
+    if (w_end <= w_begin) return false;
+    auto ref_region = index_.extract_ref(w_begin, w_end);
+    if (ref_region.empty()) return false;
+
+    // Pack query both strands.
+    bwa::index::PackedSequence query;
+    query.append(read.seq.data(), read.seq.size());
+    auto qbases = query.bases();
+    std::vector<uint8_t> qfwd(qlen), qrc(qlen);
+    for (int32_t i = 0; i < qlen; ++i) {
+        qfwd[i] = qbases[i];
+        qrc[qlen - 1 - i] = rc_base(qbases[i]);
+    }
+
+    bwa::align::Alignment best;
+    bool best_rev = false;
+    bool have = false;
+    for (int s = 0; s < 2; ++s) {
+        const uint8_t* qptr = s == 0 ? qfwd.data() : qrc.data();
+        auto aln = bwa::align::sw_semi_global_extend(
+            config_.scoring,
+            std::span<const uint8_t>(qptr, qlen),
+            std::span<const uint8_t>(ref_region.data(), ref_region.size()),
+            config_.band_width);
+        if (!have || aln.score > best.score) {
+            best = std::move(aln);
+            best_rev = (s == 1);
+            have = true;
+        }
+    }
+    if (!have || best.score < config_.min_chain_score) return false;
+
+    AlnRecord rec;
+    rec.qname = std::string(read.name.view());
+    if (best_rev) {
+        rec.flag |= AlnRecord::F_REVERSE;
+        std::reverse(best.cigar.begin(), best.cigar.end());
+    }
+    rec.rname = mref->name;
+    rec.pos = (w_begin - static_cast<int32_t>(mref->offset)) + best.ref_begin + 1;
+    rec.mapq = 0;  // re-evaluated by the pairing step
+    rec.cigar = best.cigar;
+    rec.seq = std::string(read.seq.view());
+    rec.qual = std::string(read.qual.view());
+    rec.score = best.score;
+    rec.is_primary = true;
+    int32_t nm = 0;
+    for (uint32_t c : rec.cigar) {
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        int len = bwa::align::cigar_len(c);
+        if (op == bwa::align::CigarOp::Diff) nm += len;
+        else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
+    }
+    rec.tags.emplace_back("NM:i", std::to_string(nm));
+    result.mapped = true;
+    result.best_score = best.score;
+    result.primary = std::move(rec);
+    return true;
+}
+
+void Aligner::mark_pair(AlignmentResult& res, const io::SeqRecord& read,
+                        bool is_read1, const AlnRecord* mate_primary,
+                        bool mate_mapped, bool proper, int32_t tlen) const {
+    uint32_t base = AlnRecord::F_PAIRED | (is_read1 ? AlnRecord::F_READ1 : AlnRecord::F_READ2);
+    auto mark_alt = [&](AlnRecord& a) {
+        a.flag |= base;
+        if (proper) a.flag |= AlnRecord::F_PROPER_PAIR;
+        // Non-primary records carry no mate coordinates (BWA convention).
+        a.rnext = "*";
+        a.pnext = 0;
+        a.tlen = 0;
+    };
+    for (auto& s : res.secondary) mark_alt(s);
+    for (auto& s : res.supplementary) mark_alt(s);
+
+    AlnRecord& p = res.primary;
+    if (!res.mapped) {
+        p.qname = std::string(read.name.view());
+        p.seq = std::string(read.seq.view());
+        p.qual = std::string(read.qual.view());
+        p.rname = "*";
+        p.pos = 0;
+        p.mapq = 0;
+        p.cigar.clear();
+        p.score = 0;
+        p.is_primary = true;
+        p.flag = base | AlnRecord::F_UNMAP;
+        if (mate_mapped && mate_primary != nullptr) {
+            p.rnext = mate_primary->rname;
+            p.pnext = mate_primary->pos;
+        } else {
+            p.flag |= AlnRecord::F_MUNMAP;
+            p.rnext = "*";
+            p.pnext = 0;
+        }
+        p.tlen = 0;
+        return;
+    }
+    // Preserve strand/secondary/supplementary bits; replace read-index bits.
+    p.flag &= ~(AlnRecord::F_READ1 | AlnRecord::F_READ2);
+    p.flag |= base;
+    if (proper) p.flag |= AlnRecord::F_PROPER_PAIR;
+    if (mate_mapped && mate_primary != nullptr) {
+        p.rnext = (mate_primary->rname == p.rname) ? "=" : mate_primary->rname;
+        p.pnext = mate_primary->pos;
+        p.tlen = tlen;
+    } else {
+        p.flag |= AlnRecord::F_MUNMAP;
+        p.rnext = "*";
+        p.pnext = 0;
+        p.tlen = 0;
+    }
+}
+
 void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
                               const bwa::io::SeqRecord& read2,
-                              AlignmentResult& result) const {
-    // Align both reads independently
-    AlignmentResult result1, result2;
-    align_impl(read1, result1);
-    align_impl(read2, result2);
+                              AlignmentResult& res1,
+                              AlignmentResult& res2) const {
+    align_impl(read1, res1);
+    align_impl(read2, res2);
 
-    // Use the better alignment as primary
-    AlnRecord* primary;
-    AlnRecord* mate;
+    // Mate rescue for unmapped ends (BWA mem_mate_rescue equivalent).
+    bool rescued1 = false, rescued2 = false;
+    if (!res1.mapped && res2.mapped) rescued1 = rescue_end(read1, res2.primary, res1);
+    if (!res2.mapped && res1.mapped) rescued2 = rescue_end(read2, res1.primary, res2);
 
-    if (result1.best_score >= result2.best_score) {
-        result = std::move(result1);
-        primary = &result.primary;
-        if (result2.mapped) {
-            result.secondary.push_back(std::move(result2.primary));
-            mate = &result.secondary.back();
-        } else {
-            mate = nullptr;
-        }
-    } else {
-        result = std::move(result2);
-        primary = &result.primary;
-        if (result1.mapped) {
-            result.secondary.push_back(std::move(result1.primary));
-            mate = &result.secondary.back();
-        } else {
-            mate = nullptr;
+    // Proper-pair evaluation: same reference, FR orientation, insert size
+    // within [0, max_gap]. BWA infers the insert distribution from the
+    // library; we use a fixed bound — documented deviation.
+    bool proper = false;
+    int32_t tlen1 = 0, tlen2 = 0;
+    if (res1.mapped && res2.mapped && res1.primary.rname == res2.primary.rname) {
+        int32_t span1 = cigar_ref_span(res1.primary.cigar);
+        int32_t span2 = cigar_ref_span(res2.primary.cigar);
+        int32_t five1 = five_prime_pos(res1.primary, span1);
+        int32_t five2 = five_prime_pos(res2.primary, span2);
+        bool fwd1 = (res1.primary.flag & AlnRecord::F_REVERSE) == 0;
+        bool fwd2 = (res2.primary.flag & AlnRecord::F_REVERSE) == 0;
+        bool fr = (fwd1 && !fwd2 && five1 <= five2) ||
+                  (!fwd1 && fwd2 && five2 <= five1);
+        int32_t insert = (five1 <= five2) ? (five2 - five1) : (five1 - five2);
+        if (fr && insert <= config_.max_gap) {
+            proper = true;
+            // TLEN sign: positive when this end holds the leftmost 5'.
+            tlen1 = (five1 <= five2) ? insert : -insert;
+            tlen2 = -tlen1;
         }
     }
 
-    // Set paired-end FLAG bits and mate information
-    if (result.mapped && mate) {
-        // Set paired flags
-        primary->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ1;
-        mate->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ2;
-
-        // Set mate reference and position
-        primary->rnext = mate->rname;
-        primary->pnext = mate->pos;
-        mate->rnext = primary->rname;
-        mate->pnext = primary->pos;
-
-        // Check for proper pair
-        if (primary->rname == mate->rname) {
-            // Both mapped to same reference
-            // Check orientation: FR (forward-reverse) is the typical case
-            // For now, always mark as proper pair if on same reference
-            primary->flag |= AlnRecord::F_PROPER_PAIR;
-            mate->flag |= AlnRecord::F_PROPER_PAIR;
-
-            // Calculate template length (approximate)
-            int32_t tlen = mate->pos - primary->pos + 20; // +20 for read length
-            primary->tlen = tlen;
-            mate->tlen = -tlen;
-        }
-    } else if (result.mapped) {
-        // Mate didn't map
-        primary->flag = AlnRecord::F_PAIRED | AlnRecord::F_READ1 | AlnRecord::F_MUNMAP;
+    // Rescued ends that form a proper pair earn a modest MAPQ; BWA derives
+    // this from the pairing score, we use a fixed credit — documented.
+    constexpr uint8_t kRescueMapq = 20;
+    if (proper) {
+        if (rescued1) res1.primary.mapq = std::min<uint8_t>(kRescueMapq, res2.primary.mapq);
+        if (rescued2) res2.primary.mapq = std::min<uint8_t>(kRescueMapq, res1.primary.mapq);
     }
+
+    const AlnRecord* mate_of_1 = res2.mapped ? &res2.primary : nullptr;
+    const AlnRecord* mate_of_2 = res1.mapped ? &res1.primary : nullptr;
+    mark_pair(res1, read1, true, mate_of_1, res2.mapped, proper, tlen1);
+    mark_pair(res2, read2, false, mate_of_2, res1.mapped, proper, tlen2);
 }
 
 void Aligner::chain_to_alignment(const bwa::align::MEMFinder::Chain& chain,
@@ -702,13 +881,32 @@ void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result)
     }
 }
 
+// Paired-end output: both ends adjacent (read1 records, then read2
+// records), primaries emitted even when unmapped per SAM.
+void Pipeline::write_pair(std::ostream& out, const AlignmentResult& res1,
+                          const AlignmentResult& res2) const {
+    auto write_end = [&](const AlignmentResult& res) {
+        AlnRecord primary = res.primary;
+        if (res.mapped) primary.suboptimal_score = res.suboptimal_score;
+        write_sam_record(out, primary);
+        if (!res.mapped) return;
+        for (const auto& sec : res.secondary) write_sam_record(out, sec);
+        if (config_.output_supplementary) {
+            for (const auto& supp : res.supplementary) write_sam_record(out, supp);
+        }
+    };
+    write_end(res1);
+    write_end(res2);
+}
+
 void Pipeline::write_sam_record(std::ostream& out, const AlnRecord& aln) const {
     out << aln.qname << '\t';
     out << aln.flag << '\t';
     out << aln.rname << '\t';
     out << aln.pos << '\t';
     out << static_cast<int>(aln.mapq) << '\t';
-    out << format_cigar(aln.cigar) << '\t';
+    if (aln.cigar.empty()) out << "*\t";
+    else out << format_cigar(aln.cigar) << '\t';
     out << aln.rnext << '\t'
         << aln.pnext << '\t'
         << aln.tlen << '\t';

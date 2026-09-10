@@ -12,6 +12,7 @@
 #include <string_view>
 #include <optional>
 #include <functional>
+#include <utility>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -277,12 +278,14 @@ public:
         return result;
     }
 
-    // Align paired-end reads
-    AlignmentResult align_pair(const io::SeqRecord& read1,
-                               const io::SeqRecord& read2) const {
-        AlignmentResult result;
-        align_pair_impl(read1, read2, result);
-        return result;
+    // Align paired-end reads (mate rescue + proper-pair marking).
+    // Returns one result per end; unmapped ends are returned with
+    // mapped=false but a populated unmapped primary record for SAM output.
+    std::pair<AlignmentResult, AlignmentResult> align_pair(
+        const io::SeqRecord& read1, const io::SeqRecord& read2) const {
+        AlignmentResult res1, res2;
+        align_pair_impl(read1, read2, res1, res2);
+        return {std::move(res1), std::move(res2)};
     }
 
     // Align batch of reads
@@ -319,7 +322,15 @@ private:
     void align_impl(const io::SeqRecord& read, AlignmentResult& result) const;
     void align_pair_impl(const io::SeqRecord& read1,
                          const io::SeqRecord& read2,
-                         AlignmentResult& result) const;
+                         AlignmentResult& res1,
+                         AlignmentResult& res2) const;
+    // Targeted SW for an unmapped end in a window around its mapped mate.
+    bool rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
+                    AlignmentResult& result) const;
+    // Set PAIRED/READ1/READ2/PROPER/UNMAP/MUNMAP + RNEXT/PNEXT/TLEN.
+    void mark_pair(AlignmentResult& res, const io::SeqRecord& read,
+                   bool is_read1, const AlnRecord* mate_primary,
+                   bool mate_mapped, bool proper, int32_t tlen) const;
 
     // Convert MEM chain to alignment
     void chain_to_alignment(const align::MEMFinder::Chain& chain,
@@ -595,8 +606,8 @@ public:
                 write_header(buffer);
                 io::SeqRecord read1, read2;
                 while (r1.read(read1) && r2.read(read2)) {
-                    AlignmentResult result = aligner_.align_pair(read1, read2);
-                    write_alignment(buffer, result);
+                    auto [res1, res2] = aligner_.align_pair(read1, read2);
+                    write_pair(buffer, res1, res2);
                     memory::reset_tls_arena();
                 }
                 write_gzipped(sam_path, buffer.str());
@@ -613,8 +624,8 @@ public:
 
         io::SeqRecord read1, read2;
         while (r1.read(read1) && r2.read(read2)) {
-            AlignmentResult result = aligner_.align_pair(read1, read2);
-            write_alignment(*out, result);
+            auto [res1, res2] = aligner_.align_pair(read1, read2);
+            write_pair(*out, res1, res2);
             memory::reset_tls_arena();
         }
 
@@ -624,6 +635,8 @@ public:
 private:
     void write_header(std::ostream& out) const;
     void write_alignment(std::ostream& out, const AlignmentResult& result) const;
+    void write_pair(std::ostream& out, const AlignmentResult& res1,
+                    const AlignmentResult& res2) const;
     void write_sam_record(std::ostream& out, const AlnRecord& aln) const;
 };
 

@@ -198,6 +198,79 @@ int main() {
         std::remove(fa_path);
     }
 
+    // Paired-end: FR orientation gives PROPER_PAIR with signed TLEN and
+    // '=' RNEXT; an unmapped mate yields UNMAP/MUNMAP handling.
+    {
+        const char* fa_path = "/tmp/bwa_test_pair.fa";
+        const std::string r1seg = "AATTACATAACATACACGTC";  // pos 31 (1-based)
+        const std::string r2fwd = "GCTGTGTCCACCCCATCGGA";  // pos 121 (1-based)
+        // RC(r2fwd) maps reverse; fillers are homopolymers without 9-mer
+        // seeds from either segment.
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrP\n" << std::string(30, 'G') << r1seg
+               << std::string(70, 'C') << r2fwd << std::string(30, 'G') << "\n";
+        }
+        Index idx = Index::build(fa_path);
+        Aligner aligner(idx);
+
+        io::SeqRecord pe1, pe2;
+        pe1.name = "pe1/1";
+        pe1.seq = r1seg;
+        pe1.qual = "IIIIIIIIIIIIIIIIIIII";
+        pe2.name = "pe1/2";
+        // reverse complement of r2fwd
+        std::string r2rc;
+        for (auto it = r2fwd.rbegin(); it != r2fwd.rend(); ++it) {
+            char c = *it;
+            r2rc += (c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A');
+        }
+        pe2.seq = r2rc;
+        pe2.qual = "IIIIIIIIIIIIIIIIIIII";
+
+        auto [pres1, pres2] = aligner.align_pair(pe1, pe2);
+        test("Pair both mapped", pres1.mapped && pres2.mapped);
+        test("Pair read1 forward proper",
+             (pres1.primary.flag &
+              (AlnRecord::F_PAIRED | AlnRecord::F_PROPER_PAIR | AlnRecord::F_READ1)) ==
+                 (AlnRecord::F_PAIRED | AlnRecord::F_PROPER_PAIR | AlnRecord::F_READ1));
+        test("Pair read1 not reversed",
+             (pres1.primary.flag & AlnRecord::F_REVERSE) == 0);
+        test("Pair read1 pos", pres1.primary.pos == 31);
+        test("Pair read2 reversed proper",
+             (pres2.primary.flag &
+              (AlnRecord::F_PAIRED | AlnRecord::F_PROPER_PAIR |
+               AlnRecord::F_READ2 | AlnRecord::F_REVERSE)) ==
+                 (AlnRecord::F_PAIRED | AlnRecord::F_PROPER_PAIR |
+                  AlnRecord::F_READ2 | AlnRecord::F_REVERSE));
+        test("Pair read2 pos", pres2.primary.pos == 121);
+        test("Pair rnext", pres1.primary.rnext == "=" && pres2.primary.rnext == "=");
+        test("Pair pnext",
+             pres1.primary.pnext == 121 && pres2.primary.pnext == 31);
+        // 5' ends: 31 fwd, 121+20-1=140 rev -> insert 109
+        test("Pair tlen", pres1.primary.tlen == 109 && pres2.primary.tlen == -109);
+
+        // Unmapped mate (pure N): stays emitted with UNMAP, mate gets MUNMAP.
+        io::SeqRecord peN;
+        peN.name = "peU/2";
+        peN.seq = "NNNNNNNNNNNNNNNNNNNN";
+        peN.qual = "IIIIIIIIIIIIIIIIIIII";
+        auto [ures1, ures2] = aligner.align_pair(pe1, peN);
+        test("Pair-N first mapped", ures1.mapped && !ures2.mapped);
+        test("Pair-N mate unmapped flag",
+             (ures1.primary.flag & AlnRecord::F_MUNMAP) != 0);
+        test("Pair-N unmapped record",
+             (ures2.primary.flag &
+              (AlnRecord::F_PAIRED | AlnRecord::F_UNMAP | AlnRecord::F_READ2)) ==
+                 (AlnRecord::F_PAIRED | AlnRecord::F_UNMAP | AlnRecord::F_READ2));
+        test("Pair-N unmapped star",
+             ures2.primary.rname == "*" && ures2.primary.cigar.empty());
+        test("Pair-N mate coords",
+             ures2.primary.rnext == "chrP" && ures2.primary.pnext == ures1.primary.pos);
+
+        std::remove(fa_path);
+    }
+
     // N-containing reference: flanking matches must survive the N-run,
     // and the save/load roundtrip must preserve N-ness (v2 format).
     {
