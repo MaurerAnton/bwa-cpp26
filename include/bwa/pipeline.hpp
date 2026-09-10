@@ -55,7 +55,9 @@ struct Config {
 
     // Output
     bool output_sam = true;
-    bool output_secondary = true;
+    // Secondary alignments are suppressed by default (BWA mem behavior);
+    // the -a flag enables them.
+    bool output_secondary = false;
     bool output_supplementary = true;
     int min_mapq = 1;             // Minimum MAPQ
 

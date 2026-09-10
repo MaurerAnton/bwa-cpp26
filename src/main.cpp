@@ -298,56 +298,79 @@ int main(int argc, char* argv[]) {
     }
 
     if (cmd == "mem") {
-        if (argc < 4) {
-            std::cerr << "Usage: " << argv[0] << " mem <index> <fastq> [fastq2] [sam_out]\n";
+        // Parse flags: -a/--all (output secondary alignments),
+        // -t <n> (threads). Positional: <index> <fastq> [fastq2] [sam_out]
+        bool all_alignments = false;
+        int threads = 1;
+        std::vector<const char*> pos;
+        for (int i = 2; i < argc; ++i) {
+            std::string_view a = argv[i];
+            if (a == "-a" || a == "--all") {
+                all_alignments = true;
+            } else if (a == "-t" || a == "--threads") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: " << a << " requires a value\n";
+                    return 1;
+                }
+                threads = std::atoi(argv[++i]);
+                if (threads < 1) threads = 1;
+            } else {
+                pos.push_back(argv[i]);
+            }
+        }
+        if (pos.size() < 2) {
+            std::cerr << "Usage: " << argv[0]
+                      << " mem [-a] [-t threads] <index> <fastq> [fastq2] [sam_out]\n";
             return 1;
         }
-        std::cout << "Loading index " << argv[2] << "...\n";
+
+        std::cout << "Loading index " << pos[0] << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
-        Pipeline pipe(argv[2]);
+        Config cfg = Config::default_mem();
+        cfg.output_secondary = all_alignments;
+        cfg.num_threads = threads;
+        Pipeline pipe(pos[0], cfg);
         auto load_end = std::chrono::high_resolution_clock::now();
         std::cout << "Index loaded in "
                   << std::chrono::duration_cast<std::chrono::milliseconds>(load_end - start).count()
                   << " ms\n";
 
-        // Parse args:
-        //   argc==4: mem <index> <fastq>            → single-end, stdout
-        //   argc==5: mem <index> <fastq1> <fastq2>  → paired-end, stdout
-        //   argc==5: mem <index> <fastq> <sam_out>  → single-end to file
-        //   argc==6: mem <index> <fastq1> <fastq2> <sam_out> → paired-end to file
+        // Positional parsing:
+        //   mem <index> <fastq>                 → single-end, stdout
+        //   mem <index> <fastq1> <fastq2>       → paired-end, stdout
+        //   mem <index> <fastq> <sam_out>       → single-end to file
+        //   mem <index> <fastq1> <fastq2> <out> → paired-end to file
         bool has_fastq2 = false;
-        if (argc == 5) {
+        if (pos.size() == 3) {
             // Ambiguous: could be fastq1+fastq2 or fastq+sam_out
-            // Treat as paired-end if 4th arg looks like a fastq file (exists and doesn't end in .sam/.bam)
-            std::string_view arg4 = argv[4];
+            std::string_view arg4 = pos[2];
             bool looks_like_sam = (arg4.size() >= 4 &&
                                    (arg4.substr(arg4.size()-4) == ".sam" ||
                                     arg4.substr(arg4.size()-4) == ".bam"));
             if (!looks_like_sam) {
-                std::ifstream test(argv[4]);
+                std::ifstream test(pos[2]);
                 if (test.good()) {
                     has_fastq2 = true;
                 }
                 test.close();
             }
-        } else if (argc >= 6) {
-            // argc==6+: definitely paired-end
+        } else if (pos.size() >= 4) {
             has_fastq2 = true;
         }
 
         const char* sam_out = "-";
-        if (argc == 5 && !has_fastq2) {
-            sam_out = argv[4];
-        } else if (argc >= 6) {
-            sam_out = argv[5];
+        if (pos.size() == 3 && !has_fastq2) {
+            sam_out = pos[2];
+        } else if (pos.size() >= 4) {
+            sam_out = pos[3];
         }
 
         if (has_fastq2) {
-            std::cout << "Aligning paired-end " << argv[3] << " " << argv[4] << "...\n";
-            pipe.align_pair(argv[3], argv[4], sam_out);
+            std::cout << "Aligning paired-end " << pos[1] << " " << pos[2] << "...\n";
+            pipe.align_pair(pos[1], pos[2], sam_out);
         } else {
-            std::cout << "Aligning single-end " << argv[3] << "...\n";
-            pipe.align_file(argv[3], sam_out);
+            std::cout << "Aligning single-end " << pos[1] << "...\n";
+            pipe.align_file(pos[1], sam_out);
         }
         return 0;
     }

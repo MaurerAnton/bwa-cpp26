@@ -52,6 +52,14 @@ bwa-cpp26 mem index_prefix reads.fq > alignments.sam
 bwa-cpp26 mem index_prefix reads_1.fq reads_2.fq > alignments.sam
 ```
 
+### Output all alignments (secondary hits)
+```bash
+bwa-cpp26 mem -a index_prefix reads.fq > alignments.sam
+```
+
+Flags: `-a` outputs secondary alignments (suppressed by default, like
+BWA); `-t <n>` sets the thread count.
+
 ### Output to BAM
 ```bash
 bwa-cpp26 mem index_prefix reads.fq | samtools view -b - > alignments.bam

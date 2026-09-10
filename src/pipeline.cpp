@@ -964,9 +964,11 @@ void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result)
     primary.suboptimal_score = result.suboptimal_score;
     write_sam_record(out, primary);
 
-    // Write secondary alignments
-    for (const auto& sec : result.secondary) {
-        write_sam_record(out, sec);
+    // Write secondary alignments (BWA suppresses these unless -a)
+    if (config_.output_secondary) {
+        for (const auto& sec : result.secondary) {
+            write_sam_record(out, sec);
+        }
     }
 
     // Write supplementary alignments (already carry SA:Z tags)
@@ -986,7 +988,9 @@ void Pipeline::write_pair(std::ostream& out, const AlignmentResult& res1,
         if (res.mapped) primary.suboptimal_score = res.suboptimal_score;
         write_sam_record(out, primary);
         if (!res.mapped) return;
-        for (const auto& sec : res.secondary) write_sam_record(out, sec);
+        if (config_.output_secondary) {
+            for (const auto& sec : res.secondary) write_sam_record(out, sec);
+        }
         if (config_.output_supplementary) {
             for (const auto& supp : res.supplementary) write_sam_record(out, supp);
         }
