@@ -175,8 +175,8 @@ AGPL-3.0-only - Same as original BWA.
 - [x] Performance benchmarking (see below)
 - [x] Supplementary alignment (SA tag)
 - [x] Proper paired-end (FR proper-pair flags, TLEN, mate rescue)
+- [x] Insert-size distribution estimation (sampled, trimmed moments)
 - [ ] Base quality recalibration
-- [ ] Insert-size distribution estimation
 
 ## Performance notes
 
@@ -188,7 +188,8 @@ AGPL-3.0-only - Same as original BWA.
   ~16 s; 2000 simulated 150-mers with 1% error align in ~7.5 s
   (~2.8 ms/read) single-threaded and ~4.4 s with `-t 3`; 0 unmapped,
   1978/2000 within 5 bp of truth, 1939 MAPQ60.
-- 1000 simulated 350 bp-insert pairs: 98.9% flagged proper pair.
+- 1000 simulated 350 bp-insert pairs: 98.9% flagged proper pair with
+  TLEN = +/-350 (insert size is estimated from the first 512 pairs).
 
 ## Command-line options
 

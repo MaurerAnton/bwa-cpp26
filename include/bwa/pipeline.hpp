@@ -36,6 +36,15 @@ struct ReadGroup {
     std::string platform_unit;
 };
 
+// Insert-size distribution estimated from a sample of read pairs
+// (BWA mem_pestat equivalent). Used for proper-pair classification and
+// mate-rescue windows; falls back to config bounds when invalid.
+struct InsertSizeStats {
+    double mean = 0.0;
+    double std = 0.0;
+    bool valid = false;
+};
+
 // Main configuration
 struct Config {
     // Algorithm parameters
@@ -274,6 +283,7 @@ class Aligner {
     Config config_;
     align::MEMFinder mem_finder_;
     mutable memory::Arena arena_;
+    InsertSizeStats insert_stats_;
 
 public:
     Aligner(const Index& idx, const Config& cfg = Config::default_mem())
@@ -281,6 +291,12 @@ public:
           mem_finder_(idx.num_references() > 0 ? idx.fm_index()[0] : empty_fm_index(),
                       cfg.min_seed_len, cfg.max_occ, cfg.scoring.match),
           arena_(64 * 1024) {}
+
+    // Insert-size stats (set from a sample before the main paired pass).
+    void set_insert_stats(const InsertSizeStats& s) noexcept { insert_stats_ = s; }
+    [[nodiscard]] const InsertSizeStats& insert_stats() const noexcept {
+        return insert_stats_;
+    }
 
     // Align single read
     AlignmentResult align(const io::SeqRecord& read) const {
@@ -403,6 +419,7 @@ class Pipeline {
     Index index_;
     Config config_;
     mutable Aligner aligner_;
+    mutable InsertSizeStats insert_stats_;
 
 public:
     Pipeline(const char* index_prefix, const Config& cfg = Config::default_mem())
@@ -621,6 +638,7 @@ public:
 
     // Align paired FASTQ files
     void align_pair(const char* fastq1, const char* fastq2, const char* sam_path = "-") const {
+        ensure_insert_size(fastq1, fastq2);
         if (config_.num_threads > 1) {
             align_pair_parallel(fastq1, fastq2, sam_path, config_.num_threads);
             return;
@@ -664,6 +682,10 @@ public:
     }
 
 private:
+    // Estimate the insert-size distribution from a sample of read pairs
+    // (single-threaded pre-pass; no-op for stdin or when already valid).
+    void ensure_insert_size(const char* fastq1, const char* fastq2) const;
+
     void write_header(std::ostream& out) const;
     void write_alignment(std::ostream& out, const AlignmentResult& result) const;
     void write_pair(std::ostream& out, const AlignmentResult& res1,

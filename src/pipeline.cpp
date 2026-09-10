@@ -526,9 +526,13 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
 }
 
 // 5' reference position of an alignment (1-based POS is leftmost).
+// 0-based 5' reference coordinate of an alignment (leftmost for forward,
+// rightmost for reverse). TLEN is the inclusive distance between the two
+// 5' ends, so callers add 1 (matches BWA mem_reg2sam).
 static int32_t five_prime_pos(const AlnRecord& a, int32_t ref_span) {
     bool rev = (a.flag & AlnRecord::F_REVERSE) != 0;
-    return rev ? a.pos + ref_span - 1 : a.pos;
+    int32_t left0 = a.pos > 0 ? a.pos - 1 : 0;
+    return rev ? left0 + ref_span - 1 : left0;
 }
 
 // Reference span (aligned ref length) from CIGAR, excluding clips.
@@ -562,13 +566,18 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
     if (mref == nullptr) return false;
     int32_t mate_global = static_cast<int32_t>(mref->offset) + (mate.pos - 1);
 
-    // Search window around the mate (BWA infers this from the insert-size
-    // distribution; we use a fixed window — documented deviation).
-    constexpr int32_t kRescueWindow = 2000;
+    // Search window around the mate: estimated insert distribution when
+    // available (mean + 4*std), else a fixed 2kb window.
+    int32_t rescue_window = 2000;
+    if (insert_stats_.valid) {
+        rescue_window = static_cast<int32_t>(insert_stats_.mean +
+                                             4.0 * insert_stats_.std);
+        if (rescue_window < 200) rescue_window = 200;
+    }
     int32_t w_begin = std::max<int32_t>(static_cast<int32_t>(mref->offset),
-                                        mate_global - kRescueWindow);
+                                        mate_global - rescue_window);
     int32_t w_end = std::min<int32_t>(static_cast<int32_t>(mref->offset + mref->length),
-                                      mate_global + kRescueWindow + qlen);
+                                      mate_global + rescue_window + qlen);
     if (w_end <= w_begin) return false;
     auto ref_region = index_.extract_ref(w_begin, w_end);
     if (ref_region.empty()) return false;
@@ -699,9 +708,8 @@ void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
     }
 
     // Proper-pair evaluation: same reference, FR orientation, insert size
-    // within [0, max_gap]. BWA infers the insert distribution from the
-    // library; we use a fixed bound — documented deviation. -P (skip_pairing)
-    // suppresses the proper-pair computation.
+    // within the estimated distribution (mean + 4*std) when available, else
+    // the config bound. -P (skip_pairing) suppresses the computation.
     bool proper = false;
     int32_t tlen1 = 0, tlen2 = 0;
     if (!config_.skip_pairing && res1.mapped && res2.mapped &&
@@ -715,7 +723,14 @@ void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
         bool fr = (fwd1 && !fwd2 && five1 <= five2) ||
                   (!fwd1 && fwd2 && five2 <= five1);
         int32_t insert = (five1 <= five2) ? (five2 - five1) : (five1 - five2);
-        if (fr && insert <= config_.max_gap) {
+        insert += 1;  // inclusive 5'-to-5' distance (SAM TLEN convention)
+        int32_t max_insert = config_.max_gap;
+        if (insert_stats_.valid) {
+            max_insert = static_cast<int32_t>(insert_stats_.mean +
+                                              4.0 * insert_stats_.std);
+            if (max_insert < 1) max_insert = 1;
+        }
+        if (fr && insert <= max_insert) {
             proper = true;
             // TLEN sign: positive when this end holds the leftmost 5'.
             tlen1 = (five1 <= five2) ? insert : -insert;
@@ -1085,6 +1100,62 @@ void write_bam_records(const Index& index, const Config& config,
 
 }  // namespace
 
+// Estimate insert-size mean/std from the first sampled pairs (BWA
+// mem_pestat equivalent): only uniquely mapped, same-reference, FR pairs
+// are used; the extreme 10% on each side is trimmed before computing the
+// moments. No-op for stdin input or when stats are already available.
+void Pipeline::ensure_insert_size(const char* fastq1, const char* fastq2) const {
+    if (insert_stats_.valid) return;
+    if (std::string_view(fastq1) == "-" || std::string_view(fastq2) == "-") return;
+    io::SeqReader r1(fastq1), r2(fastq2);
+    if (!r1.is_open() || !r2.is_open()) return;
+
+    constexpr size_t kSample = 512;
+    constexpr int32_t kMinMapq = 20;
+    io::SeqRecord a, b;
+    std::vector<int32_t> sizes;
+    for (size_t n = 0; n < kSample && r1.read(a) && r2.read(b); ++n) {
+        auto [res1, res2] = aligner_.align_pair(a, b);
+        if (res1.mapped && res2.mapped &&
+            res1.primary.rname == res2.primary.rname &&
+            res1.primary.mapq >= kMinMapq && res2.primary.mapq >= kMinMapq) {
+            int32_t span1 = cigar_ref_span(res1.primary.cigar);
+            int32_t span2 = cigar_ref_span(res2.primary.cigar);
+            int32_t five1 = five_prime_pos(res1.primary, span1);
+            int32_t five2 = five_prime_pos(res2.primary, span2);
+            bool fwd1 = (res1.primary.flag & AlnRecord::F_REVERSE) == 0;
+            bool fwd2 = (res2.primary.flag & AlnRecord::F_REVERSE) == 0;
+            bool fr = (fwd1 && !fwd2 && five1 <= five2) ||
+                      (!fwd1 && fwd2 && five2 <= five1);
+            if (fr) sizes.push_back(std::abs(five2 - five1) + 1);
+        }
+        memory::reset_tls_arena();
+    }
+    if (sizes.size() < 20) return;  // too few clean pairs: keep defaults
+
+    std::sort(sizes.begin(), sizes.end());
+    size_t lo = sizes.size() / 10;
+    size_t hi = sizes.size() - sizes.size() / 10;
+    if (hi <= lo) {
+        lo = 0;
+        hi = sizes.size();
+    }
+    double sum = 0.0;
+    for (size_t i = lo; i < hi; ++i) sum += sizes[i];
+    double mean = sum / static_cast<double>(hi - lo);
+    double var = 0.0;
+    for (size_t i = lo; i < hi; ++i) {
+        double d = static_cast<double>(sizes[i]) - mean;
+        var += d * d;
+    }
+    var /= static_cast<double>(hi - lo);
+
+    insert_stats_.mean = mean;
+    insert_stats_.std = std::sqrt(var);
+    insert_stats_.valid = true;
+    aligner_.set_insert_stats(insert_stats_);
+}
+
 void Pipeline::align_to_bam(const char* fastq_path, const char* bam_path) const {
     std::vector<BamEntry> recs;
     io::SeqReader reader(fastq_path);
@@ -1102,6 +1173,7 @@ void Pipeline::align_to_bam(const char* fastq_path, const char* bam_path) const 
 
 void Pipeline::align_pair_to_bam(const char* fastq1, const char* fastq2,
                                  const char* bam_path) const {
+    ensure_insert_size(fastq1, fastq2);
     std::vector<BamEntry> recs;
     io::SeqReader r1(fastq1), r2(fastq2);
     io::SeqRecord read1, read2;

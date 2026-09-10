@@ -285,8 +285,8 @@ int main() {
         test("Pair rnext", pres1.primary.rnext == "=" && pres2.primary.rnext == "=");
         test("Pair pnext",
              pres1.primary.pnext == 121 && pres2.primary.pnext == 31);
-        // 5' ends: 31 fwd, 121+20-1=140 rev -> insert 109
-        test("Pair tlen", pres1.primary.tlen == 109 && pres2.primary.tlen == -109);
+        // 5' ends: 0-based 30 fwd, 139 rev -> inclusive TLEN 110
+        test("Pair tlen", pres1.primary.tlen == 110 && pres2.primary.tlen == -110);
 
         // Unmapped mate (pure N): stays emitted with UNMAP, mate gets MUNMAP.
         io::SeqRecord peN;

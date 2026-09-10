@@ -89,4 +89,58 @@ python3 "$(dirname "$0")/validate_bam.py" "$TEST_DIR/aln.bam" "$TEST_DIR/aln.sam
     || fail "BAM/BAI structural validation failed"
 echo "PASS: BAM/BAI validated"
 
+echo "=== Paired-end (insert-size estimation) ==="
+python3 - "$TEST_DIR" << 'PY'
+import random, sys
+d = sys.argv[1]
+random.seed(7)
+ref = ''.join(random.choice('ACGT') for _ in range(2000))
+open(d + '/pair_ref.fa', 'w').write('>pair_chr\n' + ref + '\n')
+L, ins = 50, 300
+f1 = open(d + '/p1.fq', 'w')
+f2 = open(d + '/p2.fq', 'w')
+rc = str.maketrans('ACGT', 'TGCA')
+for i in range(30):
+    p = 100 + i * 50
+    a = ref[p:p + L]
+    b = ref[p + ins - L:p + ins]
+    r2 = b.translate(rc)[::-1]
+    f1.write(f'@pair{i}/1\n{a}\n+\n' + 'I' * L + '\n')
+    f2.write(f'@pair{i}/2\n{r2}\n+\n' + 'I' * L + '\n')
+f1.close()
+f2.close()
+PY
+"$BWA_CPP26" index "$TEST_DIR/pair_ref.fa" "$TEST_DIR/pair_idx" > /dev/null
+"$BWA_CPP26" mem "$TEST_DIR/pair_idx" "$TEST_DIR/p1.fq" "$TEST_DIR/p2.fq" \
+    "$TEST_DIR/pair.sam" > /dev/null 2> "$TEST_DIR/pair_stderr.txt"
+[ -s "$TEST_DIR/pair.sam" ] || { cat "$TEST_DIR/pair_stderr.txt"; fail "empty paired SAM"; }
+python3 - "$TEST_DIR/pair.sam" << 'PY'
+import sys
+proper = 0
+total = 0
+tlen_ok = 0
+for line in open(sys.argv[1]):
+    if line.startswith('@'):
+        continue
+    f = line.rstrip('\n').split('\t')
+    total += 1
+    if int(f[1]) & 0x2:
+        proper += 1
+        if abs(int(f[8])) == 300:
+            tlen_ok += 1
+if total != 60:
+    sys.exit(f"expected 60 paired records, got {total}")
+if proper != 60:
+    sys.exit(f"expected 60 proper pairs, got {proper}")
+if tlen_ok != 60:
+    sys.exit(f"expected TLEN +/-300 for all, got {tlen_ok}")
+print("PASS: 30/30 pairs proper with TLEN 300")
+PY
+# Paired BAM must validate too.
+"$BWA_CPP26" mem "$TEST_DIR/pair_idx" "$TEST_DIR/p1.fq" "$TEST_DIR/p2.fq" \
+    -o "$TEST_DIR/pair.bam" > /dev/null 2>&1
+python3 "$(dirname "$0")/validate_bam.py" "$TEST_DIR/pair.bam" "$TEST_DIR/pair.sam" \
+    || fail "paired BAM/BAI validation failed"
+echo "PASS: paired BAM/BAI validated"
+
 echo "=== Integration test completed ==="
