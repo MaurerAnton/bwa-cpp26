@@ -79,4 +79,14 @@ if awk '$1 == "read3" && $3 != "*" && and($2, 4) == 0' "$TEST_DIR/aln.sam" | gre
 fi
 echo "PASS: absent read not mapped"
 
+echo "=== BAM/BAI output ==="
+"$BWA_CPP26" mem "$TEST_DIR/test_idx" "$TEST_DIR/reads.fq" \
+    -o "$TEST_DIR/aln.bam" > /dev/null 2> "$TEST_DIR/bam_stderr.txt"
+[ -s "$TEST_DIR/aln.bam" ] || { cat "$TEST_DIR/bam_stderr.txt"; fail "empty BAM output"; }
+[ -s "$TEST_DIR/aln.bam.bai" ] || fail "missing BAI output"
+# The BAM must contain the same mapped records as the SAM.
+python3 "$(dirname "$0")/validate_bam.py" "$TEST_DIR/aln.bam" "$TEST_DIR/aln.sam" \
+    || fail "BAM/BAI structural validation failed"
+echo "PASS: BAM/BAI validated"
+
 echo "=== Integration test completed ==="

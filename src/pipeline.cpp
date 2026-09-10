@@ -62,6 +62,20 @@ std::string format_cigar(const std::vector<uint32_t>& cigar) {
 void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result) const {
     result.clear();
 
+    // Populate a SAM-ready unmapped primary record (BWA emits unmapped reads).
+    auto mark_unmapped = [&]() {
+        result.mapped = false;
+        result.primary.clear();
+        result.primary.qname = std::string(read.name.view());
+        result.primary.flag = AlnRecord::F_UNMAP;
+        result.primary.rname = "*";
+        result.primary.pos = 0;
+        result.primary.mapq = 0;
+        result.primary.seq = std::string(read.seq.view());
+        result.primary.qual = std::string(read.qual.view());
+        result.primary.is_primary = true;
+    };
+
     // Reset arena for this read
     bwa::memory::reset_tls_arena();
 
@@ -78,13 +92,13 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     query.append(read.seq.data(), read.seq.size());
 
     if (query.size() == 0) {
-        result.mapped = false;
+        mark_unmapped();
         return;
     }
 
     // Empty index: nothing to align against
     if (index_.num_references() == 0) {
-        result.mapped = false;
+        mark_unmapped();
         return;
     }
 
@@ -128,7 +142,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     }
 
     if (mems.empty()) {
-        result.mapped = false;
+        mark_unmapped();
         return;
     }
 
@@ -136,7 +150,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     auto chains = mem_finder_.chain(mems, effective_config.max_gap, effective_config.min_chain_score);
 
     if (chains.empty()) {
-        result.mapped = false;
+        mark_unmapped();
         return;
     }
 
@@ -923,6 +937,174 @@ std::string Aligner::make_sa_tag(const AlnRecord& aln) const {
     return sa;
 }
 
+namespace {
+
+// Reference span of a CIGAR (ops consuming reference).
+int32_t bam_ref_span(const std::vector<uint32_t>& cigar) {
+    int32_t span = 0;
+    for (uint32_t c : cigar) {
+        auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+        if (op == bwa::align::CigarOp::Match || op == bwa::align::CigarOp::Equal ||
+            op == bwa::align::CigarOp::Diff || op == bwa::align::CigarOp::Del ||
+            op == bwa::align::CigarOp::Skip) {
+            span += bwa::align::cigar_len(c);
+        }
+    }
+    return span;
+}
+
+struct BamEntry {
+    int32_t ref_idx = -1;
+    int32_t pos0 = -1;
+    int32_t end0 = -1;
+    io::AlnRecordView view;
+};
+
+void append_bam_entry(std::vector<BamEntry>& out, const AlnRecord& a,
+                      const Index& index) {
+    BamEntry e;
+    if (a.rname != "*") {
+        if (auto rid = index.find_ref(a.rname)) {
+            e.ref_idx = static_cast<int32_t>(*rid);
+        }
+    }
+    e.pos0 = (e.ref_idx >= 0 && a.pos > 0) ? a.pos - 1 : -1;
+    e.end0 = (e.pos0 >= 0)
+                 ? e.pos0 + std::max(1, bam_ref_span(a.cigar))
+                 : -1;
+    e.view.qname = a.qname;
+    e.view.flag = a.flag;
+    e.view.rname = a.rname;
+    e.view.pos = a.pos;
+    e.view.mapq = a.mapq;
+    e.view.cigar = a.cigar;
+    e.view.rnext = a.rnext;
+    e.view.pnext = a.pnext;
+    e.view.tlen = a.tlen;
+    e.view.seq = a.seq;
+    e.view.qual = a.qual;
+    e.view.tags = a.tags;
+    e.view.score = a.score;
+    if (a.rnext == "=") {
+        e.view.next_ref_idx = e.ref_idx;
+    } else if (a.rnext != "*") {
+        if (auto mid = index.find_ref(a.rnext)) {
+            e.view.next_ref_idx = static_cast<int32_t>(*mid);
+        }
+    }
+    out.push_back(std::move(e));
+}
+
+// Coordinate-sort records, then write BAM + BAI. The BAI requires
+// coordinate order, so records are buffered first (memory scales with the
+// number of alignments).
+void write_bam_records(const Index& index, const Config& config,
+                       std::vector<BamEntry>& recs, const char* bam_path) {
+    std::stable_sort(recs.begin(), recs.end(),
+                     [](const BamEntry& a, const BamEntry& b) {
+                         // Unmapped (refID -1) records sort last per SAM spec.
+                         const bool a_unmapped = a.ref_idx < 0;
+                         const bool b_unmapped = b.ref_idx < 0;
+                         if (a_unmapped != b_unmapped) return !a_unmapped;
+                         if (a.ref_idx != b.ref_idx) return a.ref_idx < b.ref_idx;
+                         return a.pos0 < b.pos0;
+                     });
+
+    io::BamWriter writer;
+    if (!writer.open(bam_path)) {
+        throw std::runtime_error("Cannot open BAM output file");
+    }
+
+    std::stringstream sam_header;
+    sam_header << "@HD\tVN:1.6\tSO:coordinate\n";
+    for (size_t i = 0; i < index.num_references(); ++i) {
+        const auto& ref = index.get_ref(i);
+        sam_header << "@SQ\tSN:" << ref.name << "\tLN:" << ref.length;
+        if (!ref.md5.empty()) sam_header << "\tM5:" << ref.md5;
+        sam_header << "\n";
+    }
+    if (config.read_group.has_value()) {
+        const auto& rg = config.read_group.value();
+        sam_header << "@RG\tID:" << rg.id;
+        if (!rg.sample.empty()) sam_header << "\tSM:" << rg.sample;
+        if (!rg.library.empty()) sam_header << "\tLB:" << rg.library;
+        if (!rg.platform.empty()) sam_header << "\tPL:" << rg.platform;
+        if (!rg.platform_unit.empty()) sam_header << "\tPU:" << rg.platform_unit;
+        sam_header << "\n";
+    }
+    sam_header << "@PG\tID:" << config.program_name
+               << "\tPN:" << config.program_name
+               << "\tVN:" << config.program_version
+               << "\tCL:" << config.program_command << "\n";
+
+    writer.write_header(sam_header.str(),
+                        static_cast<int32_t>(index.num_references()));
+    for (size_t i = 0; i < index.num_references(); ++i) {
+        const auto& ref = index.get_ref(i);
+        writer.write_reference(static_cast<int32_t>(ref.length), ref.name);
+    }
+
+    std::string bai_path = std::string(bam_path) + ".bai";
+    io::BaiWriter bai;
+    if (!bai.open(bai_path.c_str())) {
+        throw std::runtime_error("Cannot open BAI output file");
+    }
+    std::vector<int64_t> lengths;
+    lengths.reserve(index.num_references());
+    for (size_t i = 0; i < index.num_references(); ++i) {
+        lengths.push_back(static_cast<int64_t>(index.get_ref(i).length));
+    }
+    bai.init(lengths);
+
+    for (const auto& r : recs) {
+        int64_t off = writer.virtual_offset();  // record start for the BAI
+        writer.write_alignment(r.view, r.ref_idx);
+        bai.record_alignment(r.ref_idx, r.pos0, r.end0, off);
+    }
+    bai.write_index(writer.virtual_offset());
+    bai.close();
+    writer.close();
+}
+
+}  // namespace
+
+void Pipeline::align_to_bam(const char* fastq_path, const char* bam_path) const {
+    std::vector<BamEntry> recs;
+    io::SeqReader reader(fastq_path);
+    aligner_.align_stream(reader, [&](const AlignmentResult& result) {
+        append_bam_entry(recs, result.primary, index_);
+        if (config_.output_secondary) {
+            for (const auto& s : result.secondary) append_bam_entry(recs, s, index_);
+        }
+        if (config_.output_supplementary) {
+            for (const auto& s : result.supplementary) append_bam_entry(recs, s, index_);
+        }
+    });
+    write_bam_records(index_, config_, recs, bam_path);
+}
+
+void Pipeline::align_pair_to_bam(const char* fastq1, const char* fastq2,
+                                 const char* bam_path) const {
+    std::vector<BamEntry> recs;
+    io::SeqReader r1(fastq1), r2(fastq2);
+    io::SeqRecord read1, read2;
+    while (r1.read(read1) && r2.read(read2)) {
+        auto [res1, res2] = aligner_.align_pair(read1, read2);
+        append_bam_entry(recs, res1.primary, index_);
+        append_bam_entry(recs, res2.primary, index_);
+        if (config_.output_secondary) {
+            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_);
+            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_);
+        }
+        if (config_.output_supplementary) {
+            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_);
+            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_);
+        }
+        memory::reset_tls_arena();
+    }
+    write_bam_records(index_, config_, recs, bam_path);
+}
+
 void Pipeline::write_header(std::ostream& out) const {
     out << "@HD\tVN:1.6\tSO:coordinate\n";
 
@@ -955,14 +1137,12 @@ void Pipeline::write_header(std::ostream& out) const {
 }
 
 void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result) const {
-    if (!result.mapped) {
-        return;
-    }
-
-    // Write primary alignment with suboptimal score
+    // Primary is emitted even when unmapped (SAM spec: unmapped reads keep
+    // their SEQ/QUAL with flag 0x4 and RNAME '*').
     AlnRecord primary = result.primary;
-    primary.suboptimal_score = result.suboptimal_score;
+    if (result.mapped) primary.suboptimal_score = result.suboptimal_score;
     write_sam_record(out, primary);
+    if (!result.mapped) return;
 
     // Write secondary alignments (BWA suppresses these unless -a)
     if (config_.output_secondary) {

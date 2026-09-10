@@ -65,10 +65,12 @@ BWA); `-t <n>` sets the thread count.
 bwa-cpp26 mem index_prefix reads.fq | samtools view -b - > alignments.bam
 ```
 
-Or directly:
+Or directly (native BGZF BAM + coordinate-sorted BAI):
 ```bash
 bwa-cpp26 mem index_prefix reads.fq -o alignments.bam
 ```
+The `.bam` extension selects the native writer; any other name is SAM.
+BAM output is coordinate-sorted and gets a `<file>.bam.bai` index.
 
 ## Configuration
 

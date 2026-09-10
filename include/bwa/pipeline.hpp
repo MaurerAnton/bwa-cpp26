@@ -459,77 +459,14 @@ public:
         gzclose(gz);
     }
 
-    // Align FASTQ file to BAM output (proper BAM format with BGZF)
-    void align_to_bam(const char* fastq_path, const char* bam_path) const {
-        io::BamWriter writer;
-        if (!writer.open(bam_path)) {
-            throw std::runtime_error("Cannot open BAM output file");
-        }
+    // Align FASTQ file to BAM output (BGZF BAM + coordinate-sorted BAI).
+    // Records are buffered, coordinate-sorted, then written so the BAI is
+    // valid; memory use grows with the number of alignments.
+    void align_to_bam(const char* fastq_path, const char* bam_path) const;
 
-        // Open BAI index file
-        std::string bai_path = std::string(bam_path) + ".bai";
-        io::BaiWriter bai_writer;
-        if (!bai_writer.open(bai_path.c_str())) {
-            throw std::runtime_error("Cannot open BAI output file");
-        }
-        bai_writer.init(static_cast<int32_t>(index_.num_references()));
-
-        // Build SAM header
-        std::stringstream sam_header;
-        sam_header << "@HD\tVN:1.6\tSO:coordinate\n";
-        for (size_t i = 0; i < index_.num_references(); ++i) {
-            const auto& ref = index_.get_ref(i);
-            sam_header << "@SQ\tSN:" << ref.name << "\tLN:" << ref.length;
-            if (!ref.md5.empty()) sam_header << "\tM5:" << ref.md5;
-            sam_header << "\n";
-        }
-        sam_header << "@PG\tID:" << config_.program_name
-                   << "\tPN:" << config_.program_name
-                   << "\tVN:" << config_.program_version << "\n";
-
-        // Write BAM header
-        writer.write_header(sam_header.str(), static_cast<int32_t>(index_.num_references()));
-
-        // Write reference sequences
-        for (size_t i = 0; i < index_.num_references(); ++i) {
-            const auto& ref = index_.get_ref(i);
-            writer.write_reference(static_cast<int32_t>(ref.length), ref.name);
-        }
-
-        // Align and write
-        io::SeqReader reader(fastq_path);
-        aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-            if (result.mapped) {
-                int32_t ref_idx = 0; // Single reference for now
-                // Convert AlnRecord to AlnRecordView
-                io::AlnRecordView view;
-                view.qname = result.primary.qname;
-                view.flag = result.primary.flag;
-                view.rname = result.primary.rname;
-                view.pos = result.primary.pos;
-                view.mapq = result.primary.mapq;
-                view.cigar = result.primary.cigar;
-                view.rnext = result.primary.rnext;
-                view.pnext = result.primary.pnext;
-                view.tlen = result.primary.tlen;
-                view.seq = result.primary.seq;
-                view.qual = result.primary.qual;
-                view.tags = result.primary.tags;
-                view.score = result.primary.score;
-                writer.write_alignment(view, ref_idx);
-
-                // Record alignment in BAI index
-                int64_t file_offset = writer.virtual_offset();
-                bai_writer.record_alignment(ref_idx, result.primary.pos, file_offset);
-            }
-        });
-
-        // Write BAI index
-        bai_writer.write_index();
-        bai_writer.close();
-
-        writer.close();
-    }
+    // Paired-end variant of align_to_bam.
+    void align_pair_to_bam(const char* fastq1, const char* fastq2,
+                           const char* bam_path) const;
 
     // Parallel alignment using a simple thread pool
     void align_file_parallel(const char* fastq_path, const char* sam_path, int num_threads) const {

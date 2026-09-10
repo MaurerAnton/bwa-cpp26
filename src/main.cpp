@@ -299,9 +299,11 @@ int main(int argc, char* argv[]) {
 
     if (cmd == "mem") {
         // Parse flags: -a/--all (output secondary alignments),
-        // -t <n> (threads). Positional: <index> <fastq> [fastq2] [sam_out]
+        // -t <n> (threads), -o <file> (output; .bam selects BAM+BAI).
+        // Positional: <index> <fastq> [fastq2] [sam_out]
         bool all_alignments = false;
         int threads = 1;
+        const char* out_file = nullptr;
         std::vector<const char*> pos;
         for (int i = 2; i < argc; ++i) {
             std::string_view a = argv[i];
@@ -314,13 +316,19 @@ int main(int argc, char* argv[]) {
                 }
                 threads = std::atoi(argv[++i]);
                 if (threads < 1) threads = 1;
+            } else if (a == "-o" || a == "--output") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: " << a << " requires a value\n";
+                    return 1;
+                }
+                out_file = argv[++i];
             } else {
                 pos.push_back(argv[i]);
             }
         }
         if (pos.size() < 2) {
             std::cerr << "Usage: " << argv[0]
-                      << " mem [-a] [-t threads] <index> <fastq> [fastq2] [sam_out]\n";
+                      << " mem [-a] [-t threads] [-o out.sam|out.bam] <index> <fastq> [fastq2] [sam_out]\n";
             return 1;
         }
 
@@ -364,8 +372,25 @@ int main(int argc, char* argv[]) {
         } else if (pos.size() >= 4) {
             sam_out = pos[3];
         }
+        if (out_file != nullptr) sam_out = out_file;
 
-        if (has_fastq2) {
+        // .bam selects the native BAM+BAI writer; anything else is SAM.
+        bool bam_out = false;
+        {
+            std::string_view o = sam_out;
+            bam_out = o.size() >= 4 && o.substr(o.size() - 4) == ".bam";
+        }
+
+        if (bam_out) {
+            if (has_fastq2) {
+                std::cout << "Aligning paired-end " << pos[1] << " " << pos[2]
+                          << " to BAM...\n";
+                pipe.align_pair_to_bam(pos[1], pos[2], sam_out);
+            } else {
+                std::cout << "Aligning single-end " << pos[1] << " to BAM...\n";
+                pipe.align_to_bam(pos[1], sam_out);
+            }
+        } else if (has_fastq2) {
             std::cout << "Aligning paired-end " << pos[1] << " " << pos[2] << "...\n";
             pipe.align_pair(pos[1], pos[2], sam_out);
         } else {

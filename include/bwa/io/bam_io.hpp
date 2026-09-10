@@ -10,6 +10,7 @@
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 
 namespace bwa::io {
 
@@ -36,10 +37,25 @@ struct AlnRecordView {
     std::string qual;
     std::vector<std::pair<std::string, std::string>> tags;
     int32_t score;
+    int32_t next_ref_idx = -1;  // resolved mate reference for BAM next_refID
 };
 
+// BAM/BAI binning (SAM spec reg2bin). beg is 0-based inclusive, end 0-based
+// exclusive. Returns the smallest bin fully containing [beg, end).
+[[nodiscard]] inline uint16_t reg2bin(int32_t beg, int32_t end) noexcept {
+    if (beg < 0) beg = 0;
+    if (end <= beg) end = beg + 1;
+    --end;
+    if ((beg >> 14) == (end >> 14)) return static_cast<uint16_t>(4681 + (beg >> 14));
+    if ((beg >> 17) == (end >> 17)) return static_cast<uint16_t>(585 + (beg >> 17));
+    if ((beg >> 20) == (end >> 20)) return static_cast<uint16_t>(73 + (beg >> 20));
+    if ((beg >> 23) == (end >> 23)) return static_cast<uint16_t>(9 + (beg >> 23));
+    if ((beg >> 26) == (end >> 26)) return static_cast<uint16_t>(1 + (beg >> 26));
+    return 0;
+}
+
 // BGZF block constants
-constexpr int BGZF_BLOCK_SIZE = 65280;  // 64KB minus headers
+constexpr int BGZF_BLOCK_SIZE = 65280;  // 64KB minus headers, keeps worst case < 65536
 constexpr int BGZF_MAX_BLOCK_SIZE = 65536;
 constexpr int BGZF_HEADER_SIZE = 18;
 constexpr int BGZF_FOOTER_SIZE = 8;
@@ -107,14 +123,16 @@ inline void write_u8(std::vector<uint8_t>& buf, uint8_t val) {
     buf.push_back(val);
 }
 
-// BGZF writer
+// BGZF writer. Writes raw BGZF blocks (gzip members with a BC extra field)
+// to a plain binary stream. Virtual offsets are (compressed block offset <<
+// 16) | uncompressed offset within the block, per the BAM spec.
 class BgzfWriter {
-    gzFile gz_ = nullptr;
+    std::ofstream out_;
     std::vector<uint8_t> block_;  // Current uncompressed block
-    size_t block_pos_ = 0;        // Position in current block
-    int64_t block_offset_ = 0;    // Virtual offset of current block
-    int64_t total_offset_ = 0;    // Total bytes written (compressed)
-    int64_t uncompressed_offset_ = 0; // Uncompressed byte offset
+    size_t block_pos_ = 0;        // Bytes used in current block
+    int64_t block_offset_ = 0;    // Compressed offset of current block
+    int64_t total_offset_ = 0;    // Compressed bytes written so far
+    bool open_ = false;
 
 public:
     BgzfWriter() = default;
@@ -124,32 +142,33 @@ public:
     BgzfWriter& operator=(const BgzfWriter&) = delete;
 
     [[nodiscard]] bool open(const char* path) {
-        gz_ = gzopen(path, "wb");
-        if (!gz_) return false;
-        block_.resize(BGZF_MAX_BLOCK_SIZE);
+        out_.open(path, std::ios::binary);
+        if (!out_) return false;
+        block_.resize(BGZF_BLOCK_SIZE);
+        block_pos_ = 0;
+        block_offset_ = 0;
+        total_offset_ = 0;
+        open_ = true;
         return true;
     }
 
     void close() {
-        if (gz_) {
-            flush_block();
-            gzclose(gz_);
-            gz_ = nullptr;
-        }
+        if (!open_) return;
+        flush_block();
+        write_eof_block();
+        out_.close();
+        open_ = false;
     }
 
     // Write raw bytes
     void write(const uint8_t* data, size_t len) {
         while (len > 0) {
-            if (block_pos_ >= BGZF_BLOCK_SIZE) {
-                flush_block();
-            }
-            size_t to_write = (len < BGZF_BLOCK_SIZE - block_pos_) ? len : (BGZF_BLOCK_SIZE - block_pos_);
+            if (block_pos_ >= static_cast<size_t>(BGZF_BLOCK_SIZE)) flush_block();
+            size_t to_write = std::min(len, static_cast<size_t>(BGZF_BLOCK_SIZE) - block_pos_);
             std::memcpy(block_.data() + block_pos_, data, to_write);
             block_pos_ += to_write;
             data += to_write;
             len -= to_write;
-            uncompressed_offset_ += to_write;
         }
     }
 
@@ -158,69 +177,76 @@ public:
         write(data.data(), data.size());
     }
 
-    // Flush current block
+    // Flush current block as one BGZF member.
     void flush_block() {
         if (block_pos_ == 0) return;
 
-        // Compress with raw deflate
-        uLongf compressed_size = BGZF_MAX_BLOCK_SIZE;
-        std::vector<uint8_t> compressed(BGZF_MAX_BLOCK_SIZE);
-        compress2(compressed.data(), &compressed_size,
-                  block_.data(), block_pos_, Z_DEFAULT_COMPRESSION);
+        // BGZF payload is RAW deflate (windowBits = -15), not zlib-wrapped.
+        std::vector<uint8_t> compressed(compressBound(static_cast<uLong>(block_pos_)));
+        z_stream strm{};
+        deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                     Z_DEFAULT_STRATEGY);
+        strm.next_in = block_.data();
+        strm.avail_in = static_cast<uInt>(block_pos_);
+        strm.next_out = compressed.data();
+        strm.avail_out = static_cast<uInt>(compressed.size());
+        deflate(&strm, Z_FINISH);
+        uLongf compressed_size = strm.total_out;
+        deflateEnd(&strm);
 
-        // Write BGZF header (18 bytes)
-        std::vector<uint8_t> header;
-        header.push_back(0x1F);  // gzip magic 1
-        header.push_back(0x8B);  // gzip magic 2
-        header.push_back(0x08);  // compression method (deflate)
-        header.push_back(0x04);  // FLG (FEXTRA set)
-        header.push_back(0x00);  // MTIME
-        header.push_back(0x00);
-        header.push_back(0x00);
-        header.push_back(0x00);
-        header.push_back(0xFF);  // XFL (unknown)
-        header.push_back(0x06);  // OS (unknown)
-        header.push_back(0x00);  // XLEN
-        header.push_back(0x00);
-        // Extra field: BC subfield
-        header.push_back(0x42);  // SI1 = 'B'
-        header.push_back(0x43);  // SI2 = 'C'
-        header.push_back(0x02);  // SLEN
-        header.push_back(0x00);
-        // BSIZE = total block size - 1
-        uint16_t bsize = static_cast<uint16_t>(header.size() + 4 + compressed_size - 1);
-        header.push_back(bsize & 0xFF);
-        header.push_back((bsize >> 8) & 0xFF);
-
-        // Write header + compressed data
-        gzwrite(gz_, header.data(), static_cast<unsigned>(header.size()));
-        gzwrite(gz_, compressed.data(), static_cast<unsigned>(compressed_size));
-
-        // Footer (CRC32 + ISIZE)
+        // BSIZE = total member size - 1 = 18 (header) + compressed + 8 (footer) - 1
+        uint16_t bsize = static_cast<uint16_t>(BGZF_HEADER_SIZE + compressed_size +
+                                               BGZF_FOOTER_SIZE - 1);
+        uint8_t header[BGZF_HEADER_SIZE] = {
+            0x1F, 0x8B, 0x08, 0x04,             // gzip magic, CM=deflate, FLG=FEXTRA
+            0x00, 0x00, 0x00, 0x00,             // MTIME
+            0xFF, 0x06,                         // XFL, OS=unknown
+            0x06, 0x00,                         // XLEN=6
+            0x42, 0x43, 0x02, 0x00,             // BC subfield, SLEN=2
+            static_cast<uint8_t>(bsize & 0xFF),
+            static_cast<uint8_t>((bsize >> 8) & 0xFF)
+        };
         uint32_t crc = crc32(0L, block_.data(), static_cast<uInt>(block_pos_));
-        std::vector<uint8_t> footer;
-        footer.push_back(crc & 0xFF);
-        footer.push_back((crc >> 8) & 0xFF);
-        footer.push_back((crc >> 16) & 0xFF);
-        footer.push_back((crc >> 24) & 0xFF);
         uint32_t isize = static_cast<uint32_t>(block_pos_);
-        footer.push_back(isize & 0xFF);
-        footer.push_back((isize >> 8) & 0xFF);
-        footer.push_back((isize >> 16) & 0xFF);
-        footer.push_back((isize >> 24) & 0xFF);
-        gzwrite(gz_, footer.data(), static_cast<unsigned>(footer.size()));
+        uint8_t footer[BGZF_FOOTER_SIZE] = {
+            static_cast<uint8_t>(crc & 0xFF),
+            static_cast<uint8_t>((crc >> 8) & 0xFF),
+            static_cast<uint8_t>((crc >> 16) & 0xFF),
+            static_cast<uint8_t>((crc >> 24) & 0xFF),
+            static_cast<uint8_t>(isize & 0xFF),
+            static_cast<uint8_t>((isize >> 8) & 0xFF),
+            static_cast<uint8_t>((isize >> 16) & 0xFF),
+            static_cast<uint8_t>((isize >> 24) & 0xFF)
+        };
 
-        // Update offsets
-        total_offset_ += header.size() + compressed_size + 8;
+        out_.write(reinterpret_cast<const char*>(header), BGZF_HEADER_SIZE);
+        out_.write(reinterpret_cast<const char*>(compressed.data()),
+                   static_cast<std::streamsize>(compressed_size));
+        out_.write(reinterpret_cast<const char*>(footer), BGZF_FOOTER_SIZE);
+
+        total_offset_ += BGZF_HEADER_SIZE + static_cast<int64_t>(compressed_size) +
+                         BGZF_FOOTER_SIZE;
         block_offset_ = total_offset_;
         block_pos_ = 0;
     }
 
+    // Standard 28-byte BGZF EOF marker.
+    void write_eof_block() {
+        static const uint8_t eof[28] = {
+            0x1F, 0x8B, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x06,
+            0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1B, 0x00, 0x03, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
+        out_.write(reinterpret_cast<const char*>(eof), 28);
+        total_offset_ += 28;
+    }
+
     [[nodiscard]] int64_t virtual_offset() const {
-        return (block_offset_ << 16) | block_pos_;
+        return (block_offset_ << 16) | static_cast<int64_t>(block_pos_);
     }
 
     [[nodiscard]] int64_t total_offset() const { return total_offset_; }
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 };
 
 // BAM writer
@@ -250,24 +276,24 @@ public:
         // Magic
         for (int i = 0; i < 4; ++i) buf.push_back(BAM_MAGIC[i]);
 
-        // l_text (length of header text)
-        write_itf8(buf, static_cast<int32_t>(sam_header.size()));
+        // l_text is a plain little-endian int32 (not ITF8) per the BAM spec.
+        write_le32(buf, static_cast<int32_t>(sam_header.size()));
         buf.insert(buf.end(), sam_header.begin(), sam_header.end());
 
         // n_ref (number of reference sequences)
         write_le32(buf, num_refs);
 
-        // For each reference: l_name, name, l_ref
-        // This is written separately when we have the reference info
-        // For now, just write the header structure
-
+        // Reference entries follow via write_reference().
         bgzf_.write(buf);
     }
 
-    // Write a reference sequence entry
+    // Write a reference sequence entry: l_name (int32 LE, includes NUL),
+    // NUL-terminated name, l_ref (int32 LE).
     void write_reference(int32_t ref_len, const std::string& ref_name) {
         std::vector<uint8_t> buf;
-        write_bam_string(buf, ref_name);
+        write_le32(buf, static_cast<int32_t>(ref_name.size() + 1));
+        buf.insert(buf.end(), ref_name.begin(), ref_name.end());
+        buf.push_back(0);
         write_le32(buf, ref_len);
         bgzf_.write(buf);
     }
@@ -299,20 +325,21 @@ public:
         // mapq
         write_u8(buf, aln.mapq);
 
-        // bin
-        // Calculate bin from alignment position
-        int32_t pos = aln.pos > 0 ? aln.pos - 1 : 0;
-        uint16_t bin = 4680; // Maximum bin
-        if (pos < 0) {
-            bin = 0;
-        } else {
-            // Use a simple binning scheme
-            if (pos < 65536) bin = pos >> 14;
-            else if (pos < 262144) bin = 9 + (pos >> 17);
-            else if (pos < 1048576) bin = 15 + (pos >> 20);
-            else if (pos < 4194304) bin = 21 + (pos >> 23);
-            else if (pos < 16777216) bin = 27 + (pos >> 26);
-            else bin = 4680;
+        // bin: smallest bin containing [pos, end) per SAM spec. Unmapped
+        // (pos < 0) records use bin 4680.
+        int32_t pos = aln.pos > 0 ? aln.pos - 1 : -1;
+        uint16_t bin = 4680;
+        if (pos >= 0) {
+            int32_t ref_span = 0;
+            for (uint32_t c : aln.cigar) {
+                char op = static_cast<char>(c & 0xF);
+                int len = static_cast<int>(c >> 4);
+                // M(0) =/X(7,8) D(2) N(3) consume reference
+                if (op == 0 || op == 2 || op == 3 || op == 7 || op == 8) {
+                    ref_span += len;
+                }
+            }
+            bin = reg2bin(pos, pos + (ref_span > 0 ? ref_span : 1));
         }
         buf.push_back(bin & 0xFF);
         buf.push_back((bin >> 8) & 0xFF);
@@ -329,8 +356,8 @@ public:
         int32_t l_seq = static_cast<int32_t>(aln.seq.size());
         write_le32(buf, l_seq);
 
-        // next_refID
-        write_le32(buf, aln.rnext == "*" ? -1 : ref_idx);
+        // next_refID (resolved by the caller; "=" handled there)
+        write_le32(buf, aln.next_ref_idx);
 
         // next_pos
         write_le32(buf, aln.pnext > 0 ? aln.pnext - 1 : -1);
@@ -348,47 +375,55 @@ public:
         }
 
         // seq (4-bit packed, 0=ACGTN map 0,1,2,3,4)
+        auto base_code = [](char c) -> uint8_t {
+            switch (c) {
+                case 'A': case 'a': return 0;
+                case 'C': case 'c': return 1;
+                case 'G': case 'g': return 2;
+                case 'T': case 't': return 3;
+                case '=': return 0;
+                default: return 4;
+            }
+        };
         for (size_t i = 0; i < aln.seq.size(); i += 2) {
-            uint8_t b1 = 0, b2 = 0;
-            char c1 = aln.seq[i];
-            char c2 = (i + 1 < aln.seq.size()) ? aln.seq[i + 1] : 0;
-            // Map ACGT -> 0,1,2,3; N -> 4
-            switch (c1) {
-                case 'A': case 'a': b1 = 0; break;
-                case 'C': case 'c': b1 = 1; break;
-                case 'G': case 'g': b1 = 2; break;
-                case 'T': case 't': b1 = 3; break;
-                default: b1 = 4; break;
-            }
-            switch (c2) {
-                case 'A': case 'a': b2 = 0; break;
-                case 'C': case 'c': b2 = 1; break;
-                case 'G': case 'g': b2 = 2; break;
-                case 'T': case 't': b2 = 3; break;
-                default: b2 = 0; break;
-            }
-            buf.push_back(b1 << 4 | b2);
+            uint8_t b1 = base_code(aln.seq[i]);
+            uint8_t b2 = (i + 1 < aln.seq.size()) ? base_code(aln.seq[i + 1]) : 0;
+            buf.push_back(static_cast<uint8_t>((b1 << 4) | b2));
         }
 
-        // qual
-        for (size_t i = 0; i < aln.qual.size(); ++i) {
-            buf.push_back(static_cast<uint8_t>(aln.qual[i] - 33));
+        // qual (SAM ASCII-33; '*' means unavailable -> 0xFF)
+        if (aln.qual == "*") {
+            for (int32_t i = 0; i < l_seq; ++i) buf.push_back(0xFF);
+        } else {
+            for (size_t i = 0; i < aln.qual.size(); ++i) {
+                buf.push_back(static_cast<uint8_t>(aln.qual[i] - 33));
+            }
         }
 
-        // aux data (tags)
+        // aux data (tags). Keys carry their SAM type suffix ("NM:i", "MD:Z",
+        // "SA:Z"); legacy bare keys default to Z.
         for (const auto& tag : aln.tags) {
-            // Tag: 2 char tag name + type + value
             if (tag.first.size() < 2) continue;
-            buf.push_back(tag.first[0]);
-            buf.push_back(tag.first[1]);
-            char type = tag.second.size() == 1 ? 'A' :
-                       tag.second[0] == '-' ? 'i' : 'Z';
-            buf.push_back(type);
+            char type = 'Z';
+            std::string val = tag.second;
+            if (tag.first.size() >= 4 && tag.first[2] == ':') {
+                type = tag.first[3];
+            }
+            buf.push_back(static_cast<uint8_t>(tag.first[0]));
+            buf.push_back(static_cast<uint8_t>(tag.first[1]));
+            buf.push_back(static_cast<uint8_t>(type));
             if (type == 'i') {
-                int32_t val = std::stoi(tag.second);
-                write_le32(buf, val);
-            } else {
-                buf.insert(buf.end(), tag.second.begin(), tag.second.end());
+                write_le32(buf, static_cast<int32_t>(std::stol(val)));
+            } else if (type == 'A') {
+                buf.push_back(val.empty() ? static_cast<uint8_t>('?')
+                                          : static_cast<uint8_t>(val[0]));
+            } else if (type == 'f') {
+                float f = std::stof(val);
+                uint32_t bits;
+                std::memcpy(&bits, &f, sizeof(bits));
+                write_le_u32(buf, bits);
+            } else {  // Z/H/B treated as string for our tag set
+                buf.insert(buf.end(), val.begin(), val.end());
                 buf.push_back(0);
             }
         }
