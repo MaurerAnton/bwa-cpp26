@@ -298,43 +298,152 @@ int main(int argc, char* argv[]) {
     }
 
     if (cmd == "mem") {
-        // Parse flags: -a/--all (output secondary alignments),
-        // -t <n> (threads), -o <file> (output; .bam selects BAM+BAI).
+        // Parse flags (BWA mem-compatible subset):
+        //   -a             output secondary alignments
+        //   -t INT         threads
+        //   -o FILE        output (.bam selects BAM+BAI, else SAM)
+        //   -k INT         minimum seed length
+        //   -c INT         skip seeds with > INT occurrences
+        //   -w INT         band width
+        //   -A INT         match score
+        //   -B INT         mismatch penalty
+        //   -O INT[,INT]   gap open penalty
+        //   -E INT[,INT]   gap extension penalty
+        //   -L INT[,INT]   clipping penalty
+        //   -T INT         minimum score to output
+        //   -R STR         read group (e.g. '@RG\\tID:foo\\tSM:bar')
+        //   -M             mark split hits as secondary
+        //   -S             skip mate rescue
+        //   -P             skip pairing
         // Positional: <index> <fastq> [fastq2] [sam_out]
         bool all_alignments = false;
         int threads = 1;
         const char* out_file = nullptr;
+        Config cfg = Config::default_mem();
+        cfg.output_secondary = false;
+
+        auto parse_int = [](const char* s, int& out) -> bool {
+            char* end = nullptr;
+            long v = std::strtol(s, &end, 10);
+            if (end == s) return false;
+            out = static_cast<int>(v);
+            return true;
+        };
+        auto parse_pair = [&](const char* s, int& a, int& b) -> bool {
+            std::string_view sv(s);
+            size_t comma = sv.find(',');
+            if (comma == std::string_view::npos) {
+                return parse_int(s, a) ? (b = a, true) : false;
+            }
+            std::string first(sv.substr(0, comma));
+            std::string second(sv.substr(comma + 1));
+            return parse_int(first.c_str(), a) && parse_int(second.c_str(), b);
+        };
+
         std::vector<const char*> pos;
         for (int i = 2; i < argc; ++i) {
             std::string_view a = argv[i];
+            auto value = [&](const char* opt) -> const char* {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: " << opt << " requires a value\n";
+                    std::exit(1);
+                }
+                return argv[++i];
+            };
             if (a == "-a" || a == "--all") {
                 all_alignments = true;
             } else if (a == "-t" || a == "--threads") {
-                if (i + 1 >= argc) {
-                    std::cerr << "Error: " << a << " requires a value\n";
-                    return 1;
-                }
-                threads = std::atoi(argv[++i]);
+                if (!parse_int(value("-t"), threads)) threads = 1;
                 if (threads < 1) threads = 1;
             } else if (a == "-o" || a == "--output") {
-                if (i + 1 >= argc) {
-                    std::cerr << "Error: " << a << " requires a value\n";
-                    return 1;
+                out_file = value("-o");
+            } else if (a == "-k") {
+                int v = 0;
+                if (parse_int(value("-k"), v) && v > 0) cfg.min_seed_len = v;
+            } else if (a == "-c") {
+                int v = 0;
+                if (parse_int(value("-c"), v) && v > 0) cfg.max_occ = v;
+            } else if (a == "-w") {
+                int v = 0;
+                if (parse_int(value("-w"), v) && v > 0) cfg.band_width = v;
+            } else if (a == "-A") {
+                int v = 0;
+                if (parse_int(value("-A"), v)) cfg.scoring.match = v;
+            } else if (a == "-B") {
+                int v = 0;
+                if (parse_int(value("-B"), v)) cfg.scoring.mismatch = -std::abs(v);
+            } else if (a == "-O") {
+                int o1 = 0, o2 = 0;
+                if (parse_pair(value("-O"), o1, o2)) cfg.scoring.gap_open = -std::abs(o1);
+            } else if (a == "-E") {
+                int e1 = 0, e2 = 0;
+                if (parse_pair(value("-E"), e1, e2)) cfg.scoring.gap_ext = -std::abs(e1);
+            } else if (a == "-L") {
+                int l1 = 0, l2 = 0;
+                if (parse_pair(value("-L"), l1, l2)) cfg.scoring.clip_pen = -std::abs(l1);
+            } else if (a == "-T") {
+                int v = 0;
+                if (parse_int(value("-T"), v)) cfg.min_output_score = v;
+            } else if (a == "-R") {
+                // Accept '@RG\tID:..\tSM:..' (literal backslash-t, as BWA
+                // does) or an already-tab-separated string.
+                std::string rg(value("-R"));
+                std::string expanded;
+                expanded.reserve(rg.size());
+                for (size_t p = 0; p < rg.size(); ++p) {
+                    if (rg[p] == '\\' && p + 1 < rg.size() && rg[p + 1] == 't') {
+                        expanded.push_back('\t');
+                        ++p;
+                    } else {
+                        expanded.push_back(rg[p]);
+                    }
                 }
-                out_file = argv[++i];
+                rg = std::move(expanded);
+                if (rg.rfind("@RG", 0) == 0) {
+                    rg.erase(0, 3);
+                    if (!rg.empty() && (rg[0] == '\t' || rg[0] == ' ')) rg.erase(0, 1);
+                }
+                ReadGroup group;
+                size_t start = 0;
+                while (start <= rg.size()) {
+                    size_t tab = rg.find('\t', start);
+                    std::string field = rg.substr(start, tab == std::string::npos
+                                                             ? std::string::npos
+                                                             : tab - start);
+                    size_t colon = field.find(':');
+                    if (colon != std::string::npos) {
+                        std::string key = field.substr(0, colon);
+                        std::string val = field.substr(colon + 1);
+                        if (key == "ID") group.id = val;
+                        else if (key == "SM") group.sample = val;
+                        else if (key == "LB") group.library = val;
+                        else if (key == "PL") group.platform = val;
+                        else if (key == "PU") group.platform_unit = val;
+                    }
+                    if (tab == std::string::npos) break;
+                    start = tab + 1;
+                }
+                if (!group.id.empty()) cfg.read_group = group;
+            } else if (a == "-M") {
+                cfg.mark_split_secondary = true;
+            } else if (a == "-S") {
+                cfg.skip_mate_rescue = true;
+            } else if (a == "-P") {
+                cfg.skip_pairing = true;
             } else {
                 pos.push_back(argv[i]);
             }
         }
         if (pos.size() < 2) {
             std::cerr << "Usage: " << argv[0]
-                      << " mem [-a] [-t threads] [-o out.sam|out.bam] <index> <fastq> [fastq2] [sam_out]\n";
+                      << " mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]\n"
+                      << "            [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]\n"
+                      << "            [-T N] [-R RG] [-M] [-S] [-P] <index> <fastq> [fastq2] [sam_out]\n";
             return 1;
         }
 
         std::cout << "Loading index " << pos[0] << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
-        Config cfg = Config::default_mem();
         cfg.output_secondary = all_alignments;
         cfg.num_threads = threads;
         Pipeline pipe(pos[0], cfg);

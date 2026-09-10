@@ -170,21 +170,50 @@ AGPL-3.0-only - Same as original BWA.
 ## Roadmap
 
 - [x] Memory-mapped index files for large genomes
-- [ ] BAI index generation for BAM
+- [x] BAI index generation for BAM
 - [x] Real data testing (E. coli 4.6 MB: 2000/2000 simulated 150-mers mapped, ~97% MAPQ60)
-- [ ] Performance benchmarking
+- [x] Performance benchmarking (see below)
 - [x] Supplementary alignment (SA tag)
 - [x] Proper paired-end (FR proper-pair flags, TLEN, mate rescue)
 - [ ] Base quality recalibration
+- [ ] Insert-size distribution estimation
 
 ## Performance notes
 
-- Always benchmark with a Release build (`cmake -B build-release
-  -DCMAKE_BUILD_TYPE=Release`): the default unoptimized build is ~3x
-  slower at indexing and ~10x slower at alignment.
-- Reference points (single thread): E. coli K-12 (4.6 MB) index ~43 s
-  Release; 2000 simulated 150-mers with 1% error align in ~100 s
-  (~50 ms/read) with 0 unmapped.
+- Always benchmark with a non-sanitized Release build:
+  `cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DSANITIZE=OFF`.
+  Sanitizers are enabled by default for unoptimized builds and cost
+  ~10-15x at runtime.
+- Reference points (E. coli K-12, 4.6 MB, 4-core machine): index build
+  ~16 s; 2000 simulated 150-mers with 1% error align in ~7.5 s
+  (~2.8 ms/read) single-threaded and ~4.4 s with `-t 3`; 0 unmapped,
+  1978/2000 within 5 bp of truth, 1939 MAPQ60.
+- 1000 simulated 350 bp-insert pairs: 98.9% flagged proper pair.
+
+## Command-line options
+
+```
+bwa mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]
+        [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]
+        [-T N] [-R RG] [-M] [-S] [-P] <index> <fastq> [fastq2] [sam_out]
+```
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `-a` | output secondary alignments | off |
+| `-t N` | threads | 1 |
+| `-o F` | output file (`.bam` → BAM+BAI) | stdout SAM |
+| `-k N` | minimum seed length | 9 |
+| `-c N` | skip seeds with > N occurrences | 500 |
+| `-w N` | band width | 32 |
+| `-A/-B` | match/mismatch score | 1/-4 |
+| `-O/-E` | gap open/extension penalty | -6/-1 |
+| `-L` | clipping penalty | -5 |
+| `-T N` | minimum output score | 0 (off) |
+| `-R STR` | read group (`@RG\tID:..\tSM:..`) | none |
+| `-M` | mark split hits as secondary | off |
+| `-S` | skip mate rescue | off |
+| `-P` | skip pairing | off |
 
 ## Contributing
 

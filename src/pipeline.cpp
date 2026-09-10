@@ -236,13 +236,20 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         // Accept extensions that explain their chain: absolute floor plus
         // at least half the chain score (BWA drops extensions that keep
         // little of the seeding evidence; free query start/end clipping
-        // would otherwise promote short spurious matches).
-        if (sw_aln.score >= 10 && sw_aln.score * 2 >= chain.score) {
+        // would otherwise promote short spurious matches). -T adds an
+        // explicit output-score floor.
+        if (sw_aln.score >= 10 && sw_aln.score * 2 >= chain.score &&
+            sw_aln.score >= effective_config.min_output_score) {
             all_alignments.push_back({ci, std::move(sw_aln)});
         }
     }
 
     if (all_alignments.empty()) {
+        if (effective_config.min_output_score > 0 &&
+            best_chain.score < effective_config.min_output_score) {
+            mark_unmapped();
+            return;
+        }
         // Fall back to simple CIGAR from best chain (on its own reference)
         const auto& bmem = best_chain.mems[0];
         const auto& bref = index_.references()[static_cast<size_t>(best_chain.ref_id)];
@@ -683,17 +690,22 @@ void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
     align_impl(read1, res1);
     align_impl(read2, res2);
 
-    // Mate rescue for unmapped ends (BWA mem_mate_rescue equivalent).
+    // Mate rescue for unmapped ends (BWA mem_mate_rescue equivalent);
+    // disabled by -S (skip_mate_rescue).
     bool rescued1 = false, rescued2 = false;
-    if (!res1.mapped && res2.mapped) rescued1 = rescue_end(read1, res2.primary, res1);
-    if (!res2.mapped && res1.mapped) rescued2 = rescue_end(read2, res1.primary, res2);
+    if (!config_.skip_mate_rescue) {
+        if (!res1.mapped && res2.mapped) rescued1 = rescue_end(read1, res2.primary, res1);
+        if (!res2.mapped && res1.mapped) rescued2 = rescue_end(read2, res1.primary, res2);
+    }
 
     // Proper-pair evaluation: same reference, FR orientation, insert size
     // within [0, max_gap]. BWA infers the insert distribution from the
-    // library; we use a fixed bound — documented deviation.
+    // library; we use a fixed bound — documented deviation. -P (skip_pairing)
+    // suppresses the proper-pair computation.
     bool proper = false;
     int32_t tlen1 = 0, tlen2 = 0;
-    if (res1.mapped && res2.mapped && res1.primary.rname == res2.primary.rname) {
+    if (!config_.skip_pairing && res1.mapped && res2.mapped &&
+        res1.primary.rname == res2.primary.rname) {
         int32_t span1 = cigar_ref_span(res1.primary.cigar);
         int32_t span2 = cigar_ref_span(res2.primary.cigar);
         int32_t five1 = five_prime_pos(res1.primary, span1);
@@ -961,7 +973,7 @@ struct BamEntry {
 };
 
 void append_bam_entry(std::vector<BamEntry>& out, const AlnRecord& a,
-                      const Index& index) {
+                      const Index& index, bool mark_split_secondary = false) {
     BamEntry e;
     if (a.rname != "*") {
         if (auto rid = index.find_ref(a.rname)) {
@@ -974,6 +986,11 @@ void append_bam_entry(std::vector<BamEntry>& out, const AlnRecord& a,
                  : -1;
     e.view.qname = a.qname;
     e.view.flag = a.flag;
+    // -M: emit split hits as secondary in BAM too.
+    if (mark_split_secondary && (e.view.flag & AlnRecord::F_SUPPLEMENTARY)) {
+        e.view.flag = (e.view.flag & ~AlnRecord::F_SUPPLEMENTARY) |
+                      AlnRecord::F_SECONDARY;
+    }
     e.view.rname = a.rname;
     e.view.pos = a.pos;
     e.view.mapq = a.mapq;
@@ -1072,12 +1089,12 @@ void Pipeline::align_to_bam(const char* fastq_path, const char* bam_path) const 
     std::vector<BamEntry> recs;
     io::SeqReader reader(fastq_path);
     aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-        append_bam_entry(recs, result.primary, index_);
+        append_bam_entry(recs, result.primary, index_, config_.mark_split_secondary);
         if (config_.output_secondary) {
-            for (const auto& s : result.secondary) append_bam_entry(recs, s, index_);
+            for (const auto& s : result.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
         }
         if (config_.output_supplementary) {
-            for (const auto& s : result.supplementary) append_bam_entry(recs, s, index_);
+            for (const auto& s : result.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
         }
     });
     write_bam_records(index_, config_, recs, bam_path);
@@ -1090,15 +1107,15 @@ void Pipeline::align_pair_to_bam(const char* fastq1, const char* fastq2,
     io::SeqRecord read1, read2;
     while (r1.read(read1) && r2.read(read2)) {
         auto [res1, res2] = aligner_.align_pair(read1, read2);
-        append_bam_entry(recs, res1.primary, index_);
-        append_bam_entry(recs, res2.primary, index_);
+        append_bam_entry(recs, res1.primary, index_, config_.mark_split_secondary);
+        append_bam_entry(recs, res2.primary, index_, config_.mark_split_secondary);
         if (config_.output_secondary) {
-            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_);
-            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_);
+            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
         }
         if (config_.output_supplementary) {
-            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_);
-            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_);
+            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
         }
         memory::reset_tls_arena();
     }
@@ -1180,8 +1197,14 @@ void Pipeline::write_pair(std::ostream& out, const AlignmentResult& res1,
 }
 
 void Pipeline::write_sam_record(std::ostream& out, const AlnRecord& aln) const {
+    uint32_t flag = aln.flag;
+    // -M: emit split hits as secondary (Picard-compatible) instead of
+    // supplementary. The SA:Z tags stay; only the FLAG changes.
+    if (config_.mark_split_secondary && (flag & AlnRecord::F_SUPPLEMENTARY)) {
+        flag = (flag & ~AlnRecord::F_SUPPLEMENTARY) | AlnRecord::F_SECONDARY;
+    }
     out << aln.qname << '\t';
-    out << aln.flag << '\t';
+    out << flag << '\t';
     out << aln.rname << '\t';
     out << aln.pos << '\t';
     out << static_cast<int>(aln.mapq) << '\t';

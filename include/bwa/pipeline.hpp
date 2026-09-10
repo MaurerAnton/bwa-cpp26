@@ -60,6 +60,15 @@ struct Config {
     bool output_secondary = false;
     bool output_supplementary = true;
     int min_mapq = 1;             // Minimum MAPQ
+    // Mark split (supplementary) hits as secondary instead (-M), for
+    // pipelines that require Picard-compatible flags.
+    bool mark_split_secondary = false;
+    // Minimum alignment score to output (-T); 0 disables the filter.
+    int min_output_score = 0;
+
+    // Pairing controls (BWA -S / -P)
+    bool skip_mate_rescue = false;
+    bool skip_pairing = false;
 
     // Read group (optional, written as @RG header)
     std::optional<ReadGroup> read_group;
