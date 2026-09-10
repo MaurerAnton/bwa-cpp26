@@ -131,7 +131,7 @@ public:
     }
 
     // Read line (up to newline or EOF), consuming input in 64KB chunks.
-    [[nodiscard]] std::expected<size_t, IoError> readline(core::PmrString& buf) noexcept {
+    [[nodiscard]] std::expected<size_t, IoError> readline(std::string& buf) noexcept {
         buf.clear();
         while (true) {
             if (chunk_pos_ == chunk_len_) {
@@ -250,12 +250,15 @@ public:
     }
 };
 
-// FASTQ/FASTA record
+// FASTQ/FASTA record. Strings are heap-backed (std::string), deliberately
+// decoupled from the alignment arenas: readers retain buffers across reads,
+// so arena-backed storage would dangle when the TLS arena is reset between
+// reads.
 struct SeqRecord {
-    core::PmrString name;      // Sequence name (without @/>)
-    core::PmrString comment;   // Comment after space in header (optional)
-    core::PmrString seq;       // Sequence
-    core::PmrString qual;      // Quality (empty for FASTA)
+    std::string name;      // Sequence name (without @/>)
+    std::string comment;   // Comment after space in header (optional)
+    std::string seq;       // Sequence
+    std::string qual;      // Quality (empty for FASTA)
 
     [[nodiscard]] bool is_fasta() const noexcept { return qual.empty(); }
     [[nodiscard]] bool is_fastq() const noexcept { return !qual.empty(); }
@@ -298,11 +301,12 @@ public:
         last_error_ = IoError::None;
         last_line_read_ = false;
 
-        // Read header line (@ or >)
+        // Read header line (@ or >). A peeked header is swapped into
+        // line_buf_ (std::string::clear() may null the first byte, so a
+        // string_view into next_header_ must not outlive the clear).
         while (true) {
-            std::string_view header_line;
             if (!next_header_.empty()) {
-                header_line = next_header_.view();
+                line_buf_.swap(next_header_);
                 next_header_.clear();
             } else {
                 auto result = gz_.readline(line_buf_);
@@ -311,23 +315,19 @@ public:
                         last_error_ = result.error();
                         return std::unexpected(last_error_);
                     }
-                    header_line = line_buf_.view();
                 } else if (*result == 0 && line_buf_.empty()) {
                     last_error_ = IoError::Eof;
                     return false; // EOF
-                } else {
-                    header_line = line_buf_.view();
                 }
             }
-            if (!header_line.empty() && (header_line[0] == '>' || header_line[0] == '@')) {
-                line_buf_.assign(header_line);
+            if (!line_buf_.empty() && (line_buf_[0] == '>' || line_buf_[0] == '@')) {
                 break;
             }
             // Skip empty lines
         }
 
         // Parse header: @name comment or >name comment
-        std::string_view header = line_buf_.view().substr(1); // Skip @ or >
+        std::string_view header = std::string_view(line_buf_).substr(1); // Skip @ or >
         size_t space_pos = header.find(' ');
         if (space_pos == std::string_view::npos) {
             record.name.assign(header);
@@ -359,12 +359,14 @@ public:
             }
             if (!line_buf_.empty() && (line_buf_[0] == '>' || line_buf_[0] == '@')) {
                 // Next FASTA/FASTQ record header - save for next read
-                next_header_.assign(line_buf_.view());
+                next_header_.assign(line_buf_);
                 break;
             }
-            seq_buf_.append(line_buf_.view());
+            seq_buf_.append(line_buf_);
         }
-        record.seq = std::move(seq_buf_);
+        // Swap keeps both buffers' capacity (they are reused next read).
+        record.seq.swap(seq_buf_);
+        seq_buf_.clear();
 
         // FASTA: no quality, return immediately
         if (is_fasta_header) {
@@ -393,7 +395,8 @@ public:
         if (qual_buf_.size() > qual_needed) {
             qual_buf_.resize(qual_needed);
         }
-        record.qual = std::move(qual_buf_);
+        record.qual.swap(qual_buf_);
+        qual_buf_.clear();
 
         return true;
     }
@@ -438,10 +441,10 @@ public:
 
 private:
     GzFile gz_;
-    core::PmrString line_buf_;
-    core::PmrString seq_buf_;
-    core::PmrString qual_buf_;
-    core::PmrString next_header_;  // Stores next header line when peeked
+    std::string line_buf_;
+    std::string seq_buf_;
+    std::string qual_buf_;
+    std::string next_header_;  // Stores next header line when peeked
     bool last_line_read_ = false;
     IoError last_error_ = IoError::None;
 };
@@ -449,7 +452,7 @@ private:
 // Batch reader for parallel processing
 class BatchSeqReader {
     SeqReader reader_;
-    core::Vector<SeqRecord> buffer_;
+    std::vector<SeqRecord> buffer_;
     size_t batch_size_;
     size_t current_ = 0;
     bool exhausted_ = false;
@@ -481,7 +484,7 @@ public:
     }
 
     [[nodiscard]] std::span<SeqRecord> current_batch() noexcept {
-        return buffer_.span();
+        return {buffer_.data(), buffer_.size()};
     }
 
     [[nodiscard]] bool next_batch() {
@@ -495,7 +498,7 @@ public:
 // Writer for FASTQ/FASTA output
 class SeqWriter {
     GzFile gz_;
-    core::PmrString out_buf_;
+    std::string out_buf_;
 
 public:
     SeqWriter() = default;
@@ -512,18 +515,18 @@ public:
     [[nodiscard]] bool write_fasta(std::string_view name, std::string_view comment,
                                    std::string_view seq, int line_width = 80) noexcept {
         out_buf_.clear();
-        out_buf_.kputc('>');
-        out_buf_.kputsn(name.data(), name.size());
+        out_buf_.push_back('>');
+        out_buf_.append(name.data(), name.size());
         if (!comment.empty()) {
-            out_buf_.kputc(' ');
-            out_buf_.kputsn(comment.data(), comment.size());
+            out_buf_.push_back(' ');
+            out_buf_.append(comment.data(), comment.size());
         }
-        out_buf_.kputc('\n');
+        out_buf_.push_back('\n');
 
         for (size_t i = 0; i < seq.size(); i += line_width) {
             size_t len = std::min<size_t>(line_width, seq.size() - i);
-            out_buf_.kputsn(seq.data() + i, len);
-            out_buf_.kputc('\n');
+            out_buf_.append(seq.data() + i, len);
+            out_buf_.push_back('\n');
         }
 
         auto result = gz_.read(out_buf_.data(), out_buf_.size());
@@ -535,31 +538,31 @@ public:
                                    std::string_view seq, std::string_view qual,
                                    int line_width = 80) noexcept {
         out_buf_.clear();
-        out_buf_.kputc('@');
-        out_buf_.kputsn(name.data(), name.size());
+        out_buf_.push_back('@');
+        out_buf_.append(name.data(), name.size());
         if (!comment.empty()) {
-            out_buf_.kputc(' ');
-            out_buf_.kputsn(comment.data(), comment.size());
+            out_buf_.push_back(' ');
+            out_buf_.append(comment.data(), comment.size());
         }
-        out_buf_.kputc('\n');
+        out_buf_.push_back('\n');
 
         for (size_t i = 0; i < seq.size(); i += line_width) {
             size_t len = std::min<size_t>(line_width, seq.size() - i);
-            out_buf_.kputsn(seq.data() + i, len);
-            out_buf_.kputc('\n');
+            out_buf_.append(seq.data() + i, len);
+            out_buf_.push_back('\n');
         }
 
-        out_buf_.kputc('+');
+        out_buf_.push_back('+');
         if (!comment.empty()) {
-            out_buf_.kputc(' ');
-            out_buf_.kputsn(comment.data(), comment.size());
+            out_buf_.push_back(' ');
+            out_buf_.append(comment.data(), comment.size());
         }
-        out_buf_.kputc('\n');
+        out_buf_.push_back('\n');
 
         for (size_t i = 0; i < qual.size(); i += line_width) {
             size_t len = std::min<size_t>(line_width, qual.size() - i);
-            out_buf_.kputsn(qual.data() + i, len);
-            out_buf_.kputc('\n');
+            out_buf_.append(qual.data() + i, len);
+            out_buf_.push_back('\n');
         }
 
         auto result = gz_.read(out_buf_.data(), out_buf_.size());
@@ -568,9 +571,9 @@ public:
 
     [[nodiscard]] bool write(const SeqRecord& rec, int line_width = 80) noexcept {
         if (rec.is_fasta()) {
-            return write_fasta(rec.name.view(), rec.comment.view(), rec.seq.view(), line_width);
+            return write_fasta(rec.name, rec.comment, rec.seq, line_width);
         } else {
-            return write_fastq(rec.name.view(), rec.comment.view(), rec.seq.view(), rec.qual.view(), line_width);
+            return write_fastq(rec.name, rec.comment, rec.seq, rec.qual, line_width);
         }
     }
 

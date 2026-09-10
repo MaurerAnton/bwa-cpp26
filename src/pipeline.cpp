@@ -62,22 +62,23 @@ std::string format_cigar(const std::vector<uint32_t>& cigar) {
 void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result) const {
     result.clear();
 
+    // NOTE: do NOT reset the TLS arena here. SeqRecord's PmrStrings may be
+    // arena-backed (SeqReader), so resetting mid-flight frees the input read
+    // under us; the streaming/parallel drivers reset between reads instead.
+
     // Populate a SAM-ready unmapped primary record (BWA emits unmapped reads).
     auto mark_unmapped = [&]() {
         result.mapped = false;
         result.primary.clear();
-        result.primary.qname = std::string(read.name.view());
+        result.primary.qname = std::string(read.name);
         result.primary.flag = AlnRecord::F_UNMAP;
         result.primary.rname = "*";
         result.primary.pos = 0;
         result.primary.mapq = 0;
-        result.primary.seq = std::string(read.seq.view());
-        result.primary.qual = std::string(read.qual.view());
+        result.primary.seq = std::string(read.seq);
+        result.primary.qual = std::string(read.qual);
         result.primary.is_primary = true;
     };
-
-    // Reset arena for this read
-    bwa::memory::reset_tls_arena();
 
     // Determine effective config based on read length
     Config effective_config = config_;
@@ -178,7 +179,12 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         const auto& ref = index_.references()[static_cast<size_t>(ref_id_out)];
         int32_t ref_len = static_cast<int32_t>(ref.length);
         int32_t global_base = static_cast<int32_t>(ref.offset);
-        int32_t local_begin = chain.mems.front().ref_pos;
+        // Anchor the window on where query[0] would sit under this chain, not
+        // on the chain's first MEM. Otherwise a chain starting at query
+        // offset k puts the true DP diagonal k off the band centre and the
+        // banded extension clips everything before the chain (long reads /
+        // partial chains lost most of their aligned length this way).
+        int32_t local_begin = chain.mems.front().ref_pos - chain.query_begin;
         int32_t padding = effective_config.band_width * 2;
         ref_begin_out = global_base + std::max<int32_t>(0, local_begin - padding);
         ref_end_out = global_base + std::min<int32_t>(ref_len, local_begin + query_len + padding);
@@ -194,14 +200,11 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         query_rc[query_len - 1 - i] = rc_base(qbases[i]);
     }
 
-    // Adaptive scoring based on read length (BWA-MEM style)
-    // For longer reads, increase gap penalties to avoid spurious alignments
-    bwa::align::Scoring adaptive_scoring = effective_config.scoring;
-    if (query_len > 100) {
-        // Scale gap penalties with read length
-        adaptive_scoring.gap_open = std::min<int>(-1, static_cast<int>(-0.01 * query_len - 4));
-        adaptive_scoring.gap_ext = std::min<int>(-1, static_cast<int>(-0.1 * query_len));
-    }
+    // Scoring comes from the active preset (Config::long_reads() for long
+    // reads). An earlier heuristic scaled gap penalties with read length,
+    // which for a 5 kb read produced gap_ext=-500 and made the extension
+    // clip almost the whole read; BWA uses fixed scoring.
+    const bwa::align::Scoring& adaptive_scoring = effective_config.scoring;
 
     // Process up to max_secondary alignments (best chain + secondary chains)
     int max_alignments = std::min<int>(chains.size(), 1 + effective_config.max_occ / 100);
@@ -257,12 +260,12 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         result.mapped = true;
         result.best_score = best_chain.score;
         result.second_best_score = chains.size() > 1 ? chains[1].score : 0;
-        result.primary.qname = std::string(read.name.view());
+        result.primary.qname = std::string(read.name);
         result.primary.rname = bref.name;
         result.primary.pos = std::max<int32_t>(1, ref_pos + 1);
         result.suboptimal_score = suboptimal_score;
-        result.primary.seq = std::string(read.seq.view());
-        result.primary.qual = std::string(read.qual.view());
+        result.primary.seq = std::string(read.seq);
+        result.primary.qual = std::string(read.qual);
 
         chain_to_alignment(best_chain, read, bref, result.primary);
         if (chain_is_reverse(best_chain)) {
@@ -302,8 +305,39 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     std::sort(all_alignments.begin(), all_alignments.end(),
               [](const auto& a, const auto& b) { return a.second.score > b.second.score; });
 
+    // Deduplicate placements (BWA mem_sort_dedup_patch): distinct chains can
+    // extend to the same locus (e.g. a long read whose chains each cover the
+    // whole read). Treating identical placements as competing hits wrongly
+    // zeroed MAPQ.
+    {
+        std::vector<std::pair<int32_t, bwa::align::Alignment>> unique;
+        std::vector<std::pair<int32_t, int32_t>> seen;  // (ref_id, local pos)
+        for (auto& ent : all_alignments) {
+            const auto& chain = chains[ent.first];
+            int32_t rid = 0, rb = 0, re = 0;
+            if (!chain_ref_window(chain, rid, rb, re)) continue;
+            const auto& ref = index_.references()[static_cast<size_t>(rid)];
+            int32_t local = (rb - static_cast<int32_t>(ref.offset)) + ent.second.ref_begin;
+            bool dup = false;
+            for (const auto& s : seen) {
+                if (s.first == rid && std::abs(s.second - local) <= 5) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            seen.emplace_back(rid, local);
+            unique.push_back(std::move(ent));
+        }
+        all_alignments = std::move(unique);
+    }
+
     // Use the best alignment as primary (positions local to its reference,
     // while extract_ref needs global concatenated coordinates)
+    if (all_alignments.empty()) {
+        mark_unmapped();
+        return;
+    }
     const auto& [primary_chain_idx, primary_swaln] = all_alignments[0];
     const auto& pchain = chains[primary_chain_idx];
     int32_t p_ref_id = 0, p_ref_begin = 0, p_ref_end = 0;
@@ -321,7 +355,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     result.second_best_score = all_alignments.size() > 1 ? all_alignments[1].second.score : 0;
 
     // Build primary alignment
-    result.primary.qname = std::string(read.name.view());
+    result.primary.qname = std::string(read.name);
     result.primary.rname = pref.name;
     result.primary.pos = final_local_begin + 1;
     MapqSignals ms;
@@ -337,8 +371,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     ms.min_seed_len = mem_finder_.min_seed_len();
     result.primary.mapq = approx_mapq_se(ms);
     result.primary.score = primary_swaln.score;
-    result.primary.seq = std::string(read.seq.view());
-    result.primary.qual = std::string(read.qual.view());
+    result.primary.seq = std::string(read.seq);
+    result.primary.qual = std::string(read.qual);
     result.primary.cigar = primary_swaln.cigar;
     if (chain_rev[primary_chain_idx]) {
         result.primary.flag |= AlnRecord::F_REVERSE;
@@ -488,8 +522,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             // Query spans are in RC coordinates for reverse segments.
             int32_t seg_b = alt.rev ? query_len - s_qe : s_qb;
             int32_t seg_len = s_qe - s_qb;
-            std::string full_seq = std::string(read.seq.view());
-            std::string full_qual = std::string(read.qual.view());
+            std::string full_seq = std::string(read.seq);
+            std::string full_qual = std::string(read.qual);
             supp.seq = full_seq.substr(static_cast<size_t>(seg_b),
                                        static_cast<size_t>(seg_len));
             supp.qual = full_qual.substr(static_cast<size_t>(seg_b),
@@ -499,15 +533,15 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         }
 
         AlnRecord sec;
-        sec.qname = std::string(read.name.view());
+        sec.qname = std::string(read.name);
         sec.flag = AlnRecord::F_SECONDARY;
         sec.rname = sref.name;
         sec.pos = alt.local_pos;
         // BWA assigns MAPQ 0 to secondary alignments (mem_reg2aln)
         sec.mapq = 0;
         sec.score = sec_swaln.score;
-        sec.seq = std::string(read.seq.view());
-        sec.qual = std::string(read.qual.view());
+        sec.seq = std::string(read.seq);
+        sec.qual = std::string(read.qual);
         sec.cigar = std::move(oriented);
         if (alt.rev) sec.flag |= AlnRecord::F_REVERSE;
         int32_t sec_nm = 0;
@@ -611,7 +645,7 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
     if (!have || best.score < config_.min_chain_score) return false;
 
     AlnRecord rec;
-    rec.qname = std::string(read.name.view());
+    rec.qname = std::string(read.name);
     if (best_rev) {
         rec.flag |= AlnRecord::F_REVERSE;
         std::reverse(best.cigar.begin(), best.cigar.end());
@@ -620,8 +654,8 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
     rec.pos = (w_begin - static_cast<int32_t>(mref->offset)) + best.ref_begin + 1;
     rec.mapq = 0;  // re-evaluated by the pairing step
     rec.cigar = best.cigar;
-    rec.seq = std::string(read.seq.view());
-    rec.qual = std::string(read.qual.view());
+    rec.seq = std::string(read.seq);
+    rec.qual = std::string(read.qual);
     rec.score = best.score;
     rec.is_primary = true;
     int32_t nm = 0;
@@ -655,9 +689,9 @@ void Aligner::mark_pair(AlignmentResult& res, const io::SeqRecord& read,
 
     AlnRecord& p = res.primary;
     if (!res.mapped) {
-        p.qname = std::string(read.name.view());
-        p.seq = std::string(read.seq.view());
-        p.qual = std::string(read.qual.view());
+        p.qname = std::string(read.name);
+        p.seq = std::string(read.seq);
+        p.qual = std::string(read.qual);
         p.rname = "*";
         p.pos = 0;
         p.mapq = 0;
@@ -918,15 +952,15 @@ AlnRecord Aligner::create_supplementary(const io::SeqRecord& read,
                                         bool is_reverse,
                                         int32_t score) const {
     AlnRecord supp;
-    supp.qname = std::string(read.name.view());
+    supp.qname = std::string(read.name);
     supp.flag = AlnRecord::F_SUPPLEMENTARY;
     if (is_reverse) supp.flag |= AlnRecord::F_REVERSE;
     supp.rname = rname;
     supp.pos = pos_1based;
     supp.mapq = 0;  // BWA assigns MAPQ 0 to supplementary alignments
     supp.cigar = cigar;
-    supp.seq = std::string(read.seq.view());
-    supp.qual = std::string(read.qual.view());
+    supp.seq = std::string(read.seq);
+    supp.qual = std::string(read.qual);
     supp.score = score;
     supp.is_supplementary = true;
     supp.is_primary = false;
@@ -1410,7 +1444,7 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
     while (read_result && *read_result) {
         if (rec.is_fasta() && !rec.seq.empty()) {
             RefSequence ref;
-            ref.name = std::string(rec.name.view());
+            ref.name = std::string(rec.name);
             ref.length = rec.seq.size();
             ref.offset = total_len;
 
@@ -1419,7 +1453,7 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
                 std::string upper_seq;
                 upper_seq.reserve(rec.seq.size());
                 for (size_t i = 0; i < rec.seq.size(); ++i) {
-                    char c = rec.seq.view()[i];
+                    char c = rec.seq[i];
                     upper_seq += (c >= 'a' && c <= 'z') ? (c - 32) : c;
                 }
                 ref.md5 = compute_md5(upper_seq);

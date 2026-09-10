@@ -284,16 +284,16 @@ int main(int argc, char* argv[]) {
             std::cerr << "Usage: " << argv[0] << " index <fasta> <prefix>\n";
             return 1;
         }
-        std::cout << "Building index from " << argv[2] << " to " << argv[3] << "...\n";
+        std::cerr << "Building index from " << argv[2] << " to " << argv[3] << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
         Config cfg = Config::default_mem();
         Index idx = Index::build(argv[2], cfg);
         idx.save(argv[3]);
         auto end = std::chrono::high_resolution_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        std::cout << "Index built in " << ms << " ms\n";
-        std::cout << "References: " << idx.num_references() << "\n";
-        std::cout << "Total length: " << idx.total_length() << "\n";
+        std::cerr << "Index built in " << ms << " ms\n";
+        std::cerr << "References: " << idx.num_references() << "\n";
+        std::cerr << "Total length: " << idx.total_length() << "\n";
         return 0;
     }
 
@@ -442,13 +442,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::cout << "Loading index " << pos[0] << "...\n";
+        std::cerr << "Loading index " << pos[0] << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
         cfg.output_secondary = all_alignments;
         cfg.num_threads = threads;
         Pipeline pipe(pos[0], cfg);
         auto load_end = std::chrono::high_resolution_clock::now();
-        std::cout << "Index loaded in "
+        std::cerr << "Index loaded in "
                   << std::chrono::duration_cast<std::chrono::milliseconds>(load_end - start).count()
                   << " ms\n";
 
@@ -492,18 +492,18 @@ int main(int argc, char* argv[]) {
 
         if (bam_out) {
             if (has_fastq2) {
-                std::cout << "Aligning paired-end " << pos[1] << " " << pos[2]
+                std::cerr << "Aligning paired-end " << pos[1] << " " << pos[2]
                           << " to BAM...\n";
                 pipe.align_pair_to_bam(pos[1], pos[2], sam_out);
             } else {
-                std::cout << "Aligning single-end " << pos[1] << " to BAM...\n";
+                std::cerr << "Aligning single-end " << pos[1] << " to BAM...\n";
                 pipe.align_to_bam(pos[1], sam_out);
             }
         } else if (has_fastq2) {
-            std::cout << "Aligning paired-end " << pos[1] << " " << pos[2] << "...\n";
+            std::cerr << "Aligning paired-end " << pos[1] << " " << pos[2] << "...\n";
             pipe.align_pair(pos[1], pos[2], sam_out);
         } else {
-            std::cout << "Aligning single-end " << pos[1] << "...\n";
+            std::cerr << "Aligning single-end " << pos[1] << "...\n";
             pipe.align_file(pos[1], sam_out);
         }
         return 0;

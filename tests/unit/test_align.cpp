@@ -412,6 +412,73 @@ int main() {
         std::remove("/tmp/bwa_test_nref_idx.pac");
     }
 
+    // Long read (>224 bp, i.e. beyond PmrString's inline capacity) must keep
+    // its SEQ/QUAL intact. Regression: the aligner used to reset the TLS
+    // arena while the reader's heap-backed buffers were still live, so long
+    // reads were overwritten by alignment scratch data.
+    {
+        const char* fa_path = "/tmp/bwa_test_longread.fa";
+        const char* idx_prefix = "/tmp/bwa_test_longread_idx";
+        // Deterministic pseudo-random reference (LCG), 2000 bp.
+        std::string ref;
+        ref.reserve(2000);
+        uint32_t x = 12345;
+        for (int i = 0; i < 2000; ++i) {
+            x = x * 1664525u + 1013904223u;
+            ref += "ACGT"[(x >> 16) & 3];
+        }
+        {
+            std::ofstream fa(fa_path);
+            fa << ">longchr\n" << ref << "\n";
+        }
+        Index idx = Index::build(fa_path);
+        idx.save(idx_prefix);
+        Index loaded = Index::load(idx_prefix);
+        Aligner aligner(loaded);
+
+        // 800 bp read from offset 500, with 8 substitutions plus a few
+        // indels (long-read-like error profile).
+        std::string read_seq = ref.substr(500, 800);
+        for (int k = 0; k < 8; ++k) {
+            size_t p = 40 + static_cast<size_t>(k) * 90;
+            read_seq[p] = read_seq[p] == 'A' ? 'C' : 'A';
+        }
+        read_seq.insert(200, "TT");          // insertion
+        read_seq.erase(400, 1);              // deletion
+        read_seq.insert(600, "A");           // insertion
+        read_seq.erase(700, 1);              // deletion
+        io::SeqRecord lr;
+        lr.name = "longread";
+        lr.seq = read_seq;
+        lr.qual = std::string(read_seq.size(), 'I');
+
+        AlignmentResult res = aligner.align(lr);
+        test("LongRead mapped", res.mapped);
+        test("LongRead rname", res.primary.rname == "longchr");
+        test("LongRead pos", res.primary.pos == 501);
+        // SEQ/QUAL must be byte-identical to the input (corruption guard).
+        test("LongRead seq intact", res.primary.seq == read_seq);
+        test("LongRead qual intact", res.primary.qual == lr.qual);
+        // The extension must cover almost the whole read (regression: the
+        // window/diagonal and scoring bugs clipped most of it).
+        int32_t aligned = 0;
+        for (uint32_t c : res.primary.cigar) {
+            auto op = align::cigar_op(c);
+            if (op == align::CigarOp::Match || op == align::CigarOp::Equal ||
+                op == align::CigarOp::Diff || op == align::CigarOp::Ins) {
+                aligned += align::cigar_len(c);
+            }
+        }
+        test("LongRead span", aligned >= static_cast<int32_t>(read_seq.size()) * 95 / 100);
+
+        std::remove(fa_path);
+        std::remove("/tmp/bwa_test_longread_idx.meta");
+        std::remove("/tmp/bwa_test_longread_idx.bwt");
+        std::remove("/tmp/bwa_test_longread_idx.sa");
+        std::remove("/tmp/bwa_test_longread_idx.occ");
+        std::remove("/tmp/bwa_test_longread_idx.pac");
+    }
+
     // MAPQ model: faithful port of BWA mem_approx_mapq_se (bwamem.c).
     // Hand-computed expectations (match=1, mismatch=4):
     //   unique 20-mer, min_seed 9: 6.02*(20-9) = 66.2 -> cap 60

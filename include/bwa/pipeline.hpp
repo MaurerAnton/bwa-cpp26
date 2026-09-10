@@ -560,6 +560,9 @@ public:
                 *out << pieces[i];
                 pieces[i].clear();
             }
+            // Reads were parsed into this thread's arena; release them before
+            // parsing the next chunk.
+            memory::reset_tls_arena();
         }
 
         if (sam_file.is_open()) sam_file.close();
@@ -631,6 +634,9 @@ public:
                 *out << pieces[i];
                 pieces[i].clear();
             }
+            // Reads were parsed into this thread's arena; release them before
+            // parsing the next chunk.
+            memory::reset_tls_arena();
         }
 
         if (sam_file.is_open()) sam_file.close();
