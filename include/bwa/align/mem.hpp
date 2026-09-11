@@ -439,9 +439,20 @@ public:
             g_begin = g_end;
         }
 
-        // Best chain first (aligner takes chains[0] as primary)
-        std::sort(chains.begin(), chains.end(),
-                  [](const Chain& a, const Chain& b) { return a.score > b.score; });
+        // Best chain first (aligner takes chains[0] as primary candidate).
+        // Full tie-break for determinism: repeat copies with equal scores
+        // must order identically across runs. stable_sort keeps DP discovery
+        // order for full ties. Forward strand preferred (matches user
+        // expectation for symmetric repeats; MAPQ still flags ambiguity).
+        std::stable_sort(chains.begin(), chains.end(), [](const Chain& a, const Chain& b) {
+            if (a.score != b.score) return a.score > b.score;
+            if (a.ref_id != b.ref_id) return a.ref_id < b.ref_id;
+            if (a.ref_begin != b.ref_begin) return a.ref_begin < b.ref_begin;
+            if (a.query_begin != b.query_begin) return a.query_begin < b.query_begin;
+            bool a_fwd = !a.mems.empty() && a.mems.front().is_forward;
+            bool b_fwd = !b.mems.empty() && b.mems.front().is_forward;
+            return a_fwd > b_fwd;
+        });
 
         return chains;
     }

@@ -56,22 +56,25 @@ echo "=== Aligning reads ==="
 grep -q '^@HD' "$TEST_DIR/aln.sam" || fail "missing @HD header"
 grep -q '^@SQ.*SN:test_chr1.*LN:256' "$TEST_DIR/aln.sam" || fail "missing @SQ header"
 
-# read1/read2: mapped to test_chr1, MAPQ 60, perfect 20= CIGAR
-check_mapped() {
+# read1/read2 come from perfect tandem repeats, so every placement is
+# equally valid and MAPQ must be low (ambiguous). Assert a valid placement
+# inside the repeat block with an intact 20= CIGAR/SEQ, not an exact locus.
+check_repeat_mapped() {
     local line
-    line=$(awk -v q="$1" '$1 == q' "$TEST_DIR/aln.sam")
-    [ -n "$line" ] || fail "$1 has no SAM record"
-    echo "$line" | awk -v q="$1" -v pos="$2" \
-        '$3 == "test_chr1" && $4 == pos && $5 == 60 && $6 == "20=" {
+    line=$(awk -v q="$1" '$1 == q && $2 != 256 && $2 != 2048' "$TEST_DIR/aln.sam" | head -n 1)
+    [ -n "$line" ] || fail "$1 has no primary SAM record"
+    echo "$line" | awk -v q="$1" -v lo="$2" -v hi="$3" -v seq="$4" \
+        '$3 == "test_chr1" && $4 >= lo && $4 <= hi && $5 <= 10 && $6 == "20=" \
+         && $10 == seq {
              exit 0
-         }
-         { print "unexpected record for " q ": " $0 > "/dev/stderr"; exit 1 }' \
+          }
+          { print "unexpected record for " q ": " $0 > "/dev/stderr"; exit 1 }' \
         || fail "$1 mapping incorrect"
 }
-check_mapped read1 45
-echo "PASS: read1 mapped correctly"
-check_mapped read2 169
-echo "PASS: read2 mapped correctly"
+check_repeat_mapped read1 1 128 ACGTACGTACGTACGTACGT
+echo "PASS: read1 mapped correctly (repeat, low MAPQ)"
+check_repeat_mapped read2 129 256 AACCGGTTAACCGGTTAACC
+echo "PASS: read2 mapped correctly (repeat, low MAPQ)"
 
 # read3 has no match in the reference: must not appear as mapped
 if awk '$1 == "read3" && $3 != "*" && and($2, 4) == 0' "$TEST_DIR/aln.sam" | grep -q .; then

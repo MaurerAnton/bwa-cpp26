@@ -310,8 +310,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         return;
     }
 
-    // Sort alignments by score (descending)
-    std::sort(all_alignments.begin(), all_alignments.end(),
+    // Sort alignments by score (descending). Stable: chains arrive in
+    // deterministic (score, locus) order, so SW ties resolve to the same
+    // placement across runs.
+    std::stable_sort(all_alignments.begin(), all_alignments.end(),
               [](const auto& a, const auto& b) { return a.second.score > b.second.score; });
 
     // Deduplicate placements (BWA mem_sort_dedup_patch): distinct chains can
