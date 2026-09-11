@@ -1,0 +1,49 @@
+# Build directories (all configurations)
+build/
+build-*/
+build_test
+build_noasan/
+cmake-build-*/
+out/
+
+# Compiled objects and libraries
+*.o
+*.a
+*.so
+*.so.*
+
+# Linked binaries (the bwa executables live under build dirs)
+bwa
+bwa-test-*
+bwa-bench-*
+
+# Index files produced by `bwa index`
+*.meta
+*.bwt
+*.sa
+*.occ
+*.pac
+
+# Alignment / test outputs
+*.sam
+*.bam
+*.bai
+*.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Local scratch
+/tmp/
+*.log
+*.bak
