@@ -229,8 +229,39 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         chain_rev[ci] = chain_is_reverse(chains[ci]) ? 1 : 0;
     }
 
+    // SW is the dominant cost (~80%). The best chain is always extended, but
+    // other chains only need SW when their alignment is actually used:
+    // emitted as secondary (-a), promotable to supplementary (cross-ref), or
+    // a potential split (query span disjoint from the primary's). Skipped
+    // chains still contribute their chain scores to MAPQ, so accuracy is
+    // preserved while the common suppressed-overlapping case avoids SW.
+    const auto& primary_chain = chains[0];
+    int32_t skipped_max_score = 0;
+    int32_t skipped_count = 0;
     for (int32_t ci = 0; ci < max_alignments && ci < (int32_t)chains.size(); ++ci) {
         const auto& chain = chains[ci];
+        bool need_sw = (ci == 0) || config_.output_secondary;
+        if (!need_sw) {
+            if (config_.output_supplementary && chain.ref_id != primary_chain.ref_id) {
+                need_sw = true;  // potential supplementary
+            } else {
+                // Potential split: MEM spans (cheap proxy for SW spans)
+                // disjoint from the primary's.
+                int32_t ov = std::max(0, std::min(primary_chain.query_end, chain.query_end) -
+                                           std::max(primary_chain.query_begin, chain.query_begin));
+                int32_t ext = std::max(0, primary_chain.query_begin - chain.query_begin) +
+                              std::max(0, chain.query_end - primary_chain.query_end);
+                if (ov <= std::max(5, query_len / 10) &&
+                    ext >= effective_config.min_seed_len) {
+                    need_sw = true;
+                }
+            }
+        }
+        if (!need_sw) {
+            if (chain.score > skipped_max_score) skipped_max_score = chain.score;
+            ++skipped_count;
+            continue;
+        }
         int32_t ref_id = 0, ref_begin = 0, ref_end = 0;
         if (!chain_ref_window(chain, ref_id, ref_begin, ref_end)) continue;
 
@@ -361,7 +392,10 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
 
     result.mapped = true;
     result.best_score = primary_swaln.score;
-    result.second_best_score = all_alignments.size() > 1 ? all_alignments[1].second.score : 0;
+    // Suboptimal score combines SW-refined hits with skipped-chain scores so
+    // MAPQ sees the full competition even when SW was skipped.
+    int32_t sw_sub = all_alignments.size() > 1 ? all_alignments[1].second.score : 0;
+    result.second_best_score = std::max(sw_sub, skipped_max_score);
 
     // Build primary alignment
     result.primary.qname = std::string(read.name);
@@ -371,7 +405,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     ms.score = primary_swaln.score;
     ms.sub = result.second_best_score;
     ms.csub = suboptimal_score;
-    ms.sub_n = all_alignments.size() > 1 ? static_cast<int32_t>(all_alignments.size()) - 1 : 0;
+    ms.sub_n = static_cast<int32_t>(all_alignments.size()) - 1 + skipped_count;
+    if (ms.sub_n < 0) ms.sub_n = 0;
     ms.seedcov = seed_query_coverage(pchain);
     ms.query_span = primary_swaln.query_end - primary_swaln.query_begin;
     ms.ref_span = primary_swaln.ref_end - primary_swaln.ref_begin;
