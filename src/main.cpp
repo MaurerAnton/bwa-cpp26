@@ -430,6 +430,21 @@ int main(int argc, char* argv[]) {
                 cfg.skip_mate_rescue = true;
             } else if (a == "-P") {
                 cfg.skip_pairing = true;
+            } else if (a == "-p" || a == "--smart-pairing") {
+                cfg.smart_pairing = true;
+            } else if (a == "-Y") {
+                cfg.soft_clip_supplementary = true;
+            } else if (a == "-5") {
+                cfg.smallest_coord_primary = true;
+            } else if (a == "-x") {
+                // Read-type presets (BWA -x). Applied in order, so later
+                // options override the preset values.
+                std::string preset(value("-x"));
+                if (!cfg.apply_preset(preset)) {
+                    std::cerr << "Error: unknown -x preset '" << preset
+                              << "' (want ont2d|pacbio|intractable)\n";
+                    return 1;
+                }
             } else {
                 pos.push_back(argv[i]);
             }
@@ -438,7 +453,9 @@ int main(int argc, char* argv[]) {
             std::cerr << "Usage: " << argv[0]
                       << " mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]\n"
                       << "            [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]\n"
-                      << "            [-T N] [-R RG] [-M] [-S] [-P] <index> <fastq> [fastq2] [sam_out]\n";
+                      << "            [-T N] [-R RG] [-M] [-S] [-P] [-p] [-Y] [-5]\n"
+                      << "            [-x ont2d|pacbio|intractable]\n"
+                      << "            <index> <fastq> [fastq2] [sam_out]\n";
             return 1;
         }
 
@@ -491,7 +508,10 @@ int main(int argc, char* argv[]) {
         }
 
         if (bam_out) {
-            if (has_fastq2) {
+            if (cfg.smart_pairing) {
+                std::cerr << "Aligning interleaved " << pos[1] << " to BAM...\n";
+                pipe.align_pair_interleaved_bam(pos[1], sam_out);
+            } else if (has_fastq2) {
                 std::cerr << "Aligning paired-end " << pos[1] << " " << pos[2]
                           << " to BAM...\n";
                 pipe.align_pair_to_bam(pos[1], pos[2], sam_out);
@@ -499,6 +519,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Aligning single-end " << pos[1] << " to BAM...\n";
                 pipe.align_to_bam(pos[1], sam_out);
             }
+        } else if (cfg.smart_pairing) {
+            std::cerr << "Aligning interleaved " << pos[1] << "...\n";
+            pipe.align_pair_interleaved(pos[1], sam_out);
         } else if (has_fastq2) {
             std::cerr << "Aligning paired-end " << pos[1] << " " << pos[2] << "...\n";
             pipe.align_pair(pos[1], pos[2], sam_out);

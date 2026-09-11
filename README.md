@@ -198,7 +198,9 @@ AGPL-3.0-only - Same as original BWA.
 ```
 bwa mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]
         [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]
-        [-T N] [-R RG] [-M] [-S] [-P] <index> <fastq> [fastq2] [sam_out]
+        [-T N] [-R RG] [-M] [-S] [-P] [-p] [-Y] [-5]
+        [-x ont2d|pacbio|intractable]
+        <index> <fastq> [fastq2] [sam_out]
 ```
 
 | Flag | Meaning | Default |
@@ -217,6 +219,10 @@ bwa mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]
 | `-M` | mark split hits as secondary | off |
 | `-S` | skip mate rescue | off |
 | `-P` | skip pairing | off |
+| `-p` | interleaved pairs in one FASTQ | off |
+| `-Y` | soft-clip (not hard-clip) split hits | off |
+| `-5` | smallest-coordinate split hit is primary | off |
+| `-x PRESET` | read-type preset (`ont2d`, `pacbio`, `intractable`) | short-read defaults |
 
 ## Contributing
 

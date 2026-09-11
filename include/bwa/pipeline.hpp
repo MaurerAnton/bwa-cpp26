@@ -78,6 +78,12 @@ struct Config {
     // Pairing controls (BWA -S / -P)
     bool skip_mate_rescue = false;
     bool skip_pairing = false;
+    // -p: consecutive records in one FASTQ are mates (interleaved input).
+    bool smart_pairing = false;
+    // -Y: soft-clip (not hard-clip) split/supplementary segments.
+    bool soft_clip_supplementary = false;
+    // -5: for split alignments, the smallest-coordinate hit is primary.
+    bool smallest_coord_primary = false;
 
     // Read group (optional, written as @RG header)
     std::optional<ReadGroup> read_group;
@@ -126,6 +132,28 @@ struct Config {
         c.scoring.gap_open = -2;   // Less penalty for gaps
         c.scoring.gap_ext = -1;
         return c;
+    }
+
+    // Apply a BWA -x read-type preset in place. Later options override the
+    // preset values, so call this as the options are parsed in order.
+    // Returns false for unknown preset names.
+    bool apply_preset(std::string_view name) noexcept {
+        if (name == "ont2d" || name == "ont" || name == "nanopore") {
+            min_seed_len = 14;
+            scoring = {1, -1, -1, -1, 0, scoring.unpaired};
+            return true;
+        }
+        if (name == "pacbio" || name == "pb" || name == "ccs") {
+            min_seed_len = 17;
+            scoring = {1, -1, -1, -1, 0, scoring.unpaired};
+            return true;
+        }
+        if (name == "intractable" || name == "sr" || name == "short") {
+            min_seed_len = 19;
+            scoring = align::Scoring::bwa_mem_default();
+            return true;
+        }
+        return false;
     }
 };
 
@@ -687,9 +715,40 @@ public:
         if (sam_file.is_open()) sam_file.close();
     }
 
+    // Align interleaved paired FASTQ (-p): consecutive records form pairs.
+    void align_pair_interleaved(const char* fastq, const char* sam_path = "-") const {
+        ensure_insert_size(fastq, nullptr);
+        io::SeqReader reader(fastq);
+        std::ofstream sam_file;
+        std::ostream* out = &std::cout;
+
+        if (std::string_view(sam_path) != "-") {
+            sam_file.open(sam_path, std::ios::binary);
+            if (!sam_file) {
+                throw std::runtime_error("Cannot open SAM output file");
+            }
+            out = &sam_file;
+        }
+
+        write_header(*out);
+
+        io::SeqRecord read1, read2;
+        while (reader.read(read1) && reader.read(read2)) {
+            auto [res1, res2] = aligner_.align_pair(read1, read2);
+            write_pair(*out, res1, res2);
+            memory::reset_tls_arena();
+        }
+
+        if (sam_file.is_open()) sam_file.close();
+    }
+
+    // Interleaved paired-end variant of align_pair_to_bam.
+    void align_pair_interleaved_bam(const char* fastq, const char* bam_path) const;
+
 private:
     // Estimate the insert-size distribution from a sample of read pairs
     // (single-threaded pre-pass; no-op for stdin or when already valid).
+    // A null fastq2 means interleaved input (consecutive pairs in fastq1).
     void ensure_insert_size(const char* fastq1, const char* fastq2) const;
 
     void write_header(std::ostream& out) const;

@@ -143,4 +143,25 @@ python3 "$(dirname "$0")/validate_bam.py" "$TEST_DIR/pair.bam" "$TEST_DIR/pair.s
     || fail "paired BAM/BAI validation failed"
 echo "PASS: paired BAM/BAI validated"
 
+echo "=== Interleaved pairs (-p) and split flags (-5/-Y) ==="
+# Interleave the same pairs into one file; -p must reproduce pair.sam.
+python3 - "$TEST_DIR" << 'PY'
+import sys
+d = sys.argv[1]
+r1 = open(d + '/p1.fq').read().split('@')[1:]
+r2 = open(d + '/p2.fq').read().split('@')[1:]
+with open(d + '/inter.fq', 'w') as f:
+    for a, b in zip(r1, r2):
+        f.write('@' + a + '@' + b)
+PY
+"$BWA_CPP26" mem -p "$TEST_DIR/pair_idx" "$TEST_DIR/inter.fq" \
+    "$TEST_DIR/inter.sam" > /dev/null 2>&1
+diff <(grep -v '^@' "$TEST_DIR/pair.sam") <(grep -v '^@' "$TEST_DIR/inter.sam") \
+    || fail "-p output differs from two-file pairing"
+echo "PASS: -p interleaved matches paired output"
+# -5 and -Y must change the chimera output without breaking validation.
+"$BWA_CPP26" mem -5 -Y "$TEST_DIR/pair_idx" "$TEST_DIR/p1.fq" \
+    "$TEST_DIR/inter5.sam" > /dev/null 2>&1
+[ -s "$TEST_DIR/inter5.sam" ] || fail "-5/-Y run produced nothing"
+
 echo "=== Integration test completed ==="

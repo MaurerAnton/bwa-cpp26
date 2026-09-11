@@ -493,42 +493,104 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         if (alt.rev) std::reverse(oriented.begin(), oriented.end());
 
         if (static_cast<int>(k) == split_alt) {
-            // Strip end clips, then hard-clip the query outside [s_qb, s_qe).
-            int32_t s_qb = sec_swaln.query_begin, s_qe = sec_swaln.query_end;
-            size_t core_b = 0, core_e = oriented.size();
-            auto is_clip = [](uint32_t c) {
-                auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
-                return op == bwa::align::CigarOp::SoftClip ||
-                       op == bwa::align::CigarOp::HardClip;
+            // Build an H-clipped (or S-clipped with -Y) supplementary from a
+            // soft-clipped oriented CIGAR + query span, trimming SEQ/QUAL for
+            // hard clips. Query spans are in RC coordinates for reverse segs.
+            auto make_split_supp = [&](std::vector<uint32_t> oriented_cigar,
+                                       const std::string& rname,
+                                       int32_t local_pos, bool rev,
+                                       int32_t qb, int32_t qe,
+                                       int32_t score) {
+                size_t core_b = 0, core_e = oriented_cigar.size();
+                auto is_clip = [](uint32_t c) {
+                    auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+                    return op == bwa::align::CigarOp::SoftClip ||
+                           op == bwa::align::CigarOp::HardClip;
+                };
+                while (core_b < core_e && is_clip(oriented_cigar[core_b])) ++core_b;
+                while (core_e > core_b && is_clip(oriented_cigar[core_e - 1])) --core_e;
+                std::vector<uint32_t> hcigar;
+                const auto clip_op = config_.soft_clip_supplementary
+                                         ? bwa::align::CigarOp::SoftClip
+                                         : bwa::align::CigarOp::HardClip;
+                if (qb > 0) {
+                    hcigar.push_back(bwa::align::encode_cigar(qb, clip_op));
+                }
+                hcigar.insert(hcigar.end(), oriented_cigar.begin() + core_b,
+                              oriented_cigar.begin() + core_e);
+                if (qe < query_len) {
+                    hcigar.push_back(bwa::align::encode_cigar(
+                        query_len - qe, clip_op));
+                }
+                AlnRecord supp = create_supplementary(
+                    read, hcigar, rname, local_pos, rev, score);
+                if (!config_.soft_clip_supplementary) {
+                    int32_t seg_b = rev ? query_len - qe : qb;
+                    int32_t seg_len = qe - qb;
+                    std::string full_seq = std::string(read.seq);
+                    std::string full_qual = std::string(read.qual);
+                    supp.seq = full_seq.substr(static_cast<size_t>(seg_b),
+                                               static_cast<size_t>(seg_len));
+                    supp.qual = full_qual.substr(static_cast<size_t>(seg_b),
+                                                 static_cast<size_t>(seg_len));
+                }
+                return supp;
             };
-            while (core_b < core_e && is_clip(oriented[core_b])) ++core_b;
-            while (core_e > core_b && is_clip(oriented[core_e - 1])) --core_e;
-            if (core_b >= core_e) continue;  // fully clipped: no segment
-            std::vector<uint32_t> hcigar;
-            if (s_qb > 0) {
-                hcigar.push_back(bwa::align::encode_cigar(
-                    s_qb, bwa::align::CigarOp::HardClip));
+
+            int32_t s_qb = sec_swaln.query_begin, s_qe = sec_swaln.query_end;
+            int32_t p_qb = primary_swaln.query_begin, p_qe = primary_swaln.query_end;
+
+            // -5: the smallest-coordinate split segment becomes primary.
+            bool alt_is_primary = false;
+            if (config_.smallest_coord_primary) {
+                auto key = [&](const std::string& rname, int32_t pos) {
+                    auto rid = index_.find_ref(rname);
+                    return std::pair<int64_t, int64_t>(
+                        rid ? static_cast<int64_t>(*rid) : INT64_MAX, pos);
+                };
+                alt_is_primary =
+                    key(sref.name, alt.local_pos) <
+                    key(result.primary.rname, result.primary.pos);
             }
-            hcigar.insert(hcigar.end(), oriented.begin() + core_b,
-                          oriented.begin() + core_e);
-            if (s_qe < query_len) {
-                hcigar.push_back(bwa::align::encode_cigar(
-                    query_len - s_qe, bwa::align::CigarOp::HardClip));
+
+            if (!alt_is_primary) {
+                if (s_qe <= s_qb) continue;  // fully clipped: no segment
+                result.supplementary.push_back(make_split_supp(
+                    std::move(oriented), sref.name, alt.local_pos, alt.rev,
+                    s_qb, s_qe, sec_swaln.score));
+            } else {
+                // Promote the alt to primary (soft clips, full SEQ/QUAL) and
+                // demote the old primary to hard-clipped supplementary.
+                if (s_qe <= s_qb || p_qe <= p_qb) continue;
+                bool primary_rev =
+                    (result.primary.flag & AlnRecord::F_REVERSE) != 0;
+                AlnRecord demoted = make_split_supp(
+                    result.primary.cigar, result.primary.rname,
+                    result.primary.pos, primary_rev, p_qb, p_qe,
+                    result.primary.score);
+                AlnRecord promoted;
+                promoted.qname = std::string(read.name);
+                promoted.flag = alt.rev ? AlnRecord::F_REVERSE : 0;
+                promoted.rname = sref.name;
+                promoted.pos = alt.local_pos;
+                promoted.mapq = result.primary.mapq;
+                promoted.cigar = std::move(oriented);
+                promoted.seq = std::string(read.seq);
+                promoted.qual = std::string(read.qual);
+                promoted.score = sec_swaln.score;
+                promoted.is_primary = true;
+                int32_t nm = 0;
+                for (uint32_t c : promoted.cigar) {
+                    auto op = static_cast<bwa::align::CigarOp>(c & 0xF);
+                    int len = bwa::align::cigar_len(c);
+                    if (op == bwa::align::CigarOp::Diff) nm += len;
+                    else if (op == bwa::align::CigarOp::Ins ||
+                             op == bwa::align::CigarOp::Del) nm += len;
+                }
+                promoted.tags.emplace_back("NM:i", std::to_string(nm));
+                result.primary = std::move(promoted);
+                result.supplementary.push_back(std::move(demoted));
             }
-            AlnRecord supp = create_supplementary(read, hcigar, sref.name,
-                                                  alt.local_pos, alt.rev,
-                                                  sec_swaln.score);
-            // Hard-clipped bases are not stored in SEQ/QUAL (SAM spec).
-            // Query spans are in RC coordinates for reverse segments.
-            int32_t seg_b = alt.rev ? query_len - s_qe : s_qb;
-            int32_t seg_len = s_qe - s_qb;
-            std::string full_seq = std::string(read.seq);
-            std::string full_qual = std::string(read.qual);
-            supp.seq = full_seq.substr(static_cast<size_t>(seg_b),
-                                       static_cast<size_t>(seg_len));
-            supp.qual = full_qual.substr(static_cast<size_t>(seg_b),
-                                         static_cast<size_t>(seg_len));
-            result.supplementary.push_back(std::move(supp));
             continue;
         }
 
@@ -1140,15 +1202,25 @@ void write_bam_records(const Index& index, const Config& config,
 // moments. No-op for stdin input or when stats are already available.
 void Pipeline::ensure_insert_size(const char* fastq1, const char* fastq2) const {
     if (insert_stats_.valid) return;
-    if (std::string_view(fastq1) == "-" || std::string_view(fastq2) == "-") return;
-    io::SeqReader r1(fastq1), r2(fastq2);
-    if (!r1.is_open() || !r2.is_open()) return;
+    const bool interleaved = (fastq2 == nullptr);
+    if (std::string_view(fastq1) == "-") return;
+    if (!interleaved && std::string_view(fastq2) == "-") return;
+    io::SeqReader r1(fastq1);
+    io::SeqReader r2;
+    if (!interleaved) r2.open(fastq2);
+    if (!r1.is_open() || (!interleaved && !r2.is_open())) return;
 
     constexpr size_t kSample = 512;
     constexpr int32_t kMinMapq = 20;
     io::SeqRecord a, b;
     std::vector<int32_t> sizes;
-    for (size_t n = 0; n < kSample && r1.read(a) && r2.read(b); ++n) {
+    auto read_pair = [&]() -> bool {
+        if (interleaved) {
+            return static_cast<bool>(r1.read(a)) && static_cast<bool>(r1.read(b));
+        }
+        return static_cast<bool>(r1.read(a)) && static_cast<bool>(r2.read(b));
+    };
+    for (size_t n = 0; n < kSample && read_pair(); ++n) {
         auto [res1, res2] = aligner_.align_pair(a, b);
         if (res1.mapped && res2.mapped &&
             res1.primary.rname == res2.primary.rname &&
@@ -1212,6 +1284,28 @@ void Pipeline::align_pair_to_bam(const char* fastq1, const char* fastq2,
     io::SeqReader r1(fastq1), r2(fastq2);
     io::SeqRecord read1, read2;
     while (r1.read(read1) && r2.read(read2)) {
+        auto [res1, res2] = aligner_.align_pair(read1, read2);
+        append_bam_entry(recs, res1.primary, index_, config_.mark_split_secondary);
+        append_bam_entry(recs, res2.primary, index_, config_.mark_split_secondary);
+        if (config_.output_secondary) {
+            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+        }
+        if (config_.output_supplementary) {
+            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
+        }
+        memory::reset_tls_arena();
+    }
+    write_bam_records(index_, config_, recs, bam_path);
+}
+
+void Pipeline::align_pair_interleaved_bam(const char* fastq, const char* bam_path) const {
+    ensure_insert_size(fastq, nullptr);
+    std::vector<BamEntry> recs;
+    io::SeqReader reader(fastq);
+    io::SeqRecord read1, read2;
+    while (reader.read(read1) && reader.read(read2)) {
         auto [res1, res2] = aligner_.align_pair(read1, read2);
         append_bam_entry(recs, res1.primary, index_, config_.mark_split_secondary);
         append_bam_entry(recs, res2.primary, index_, config_.mark_split_secondary);

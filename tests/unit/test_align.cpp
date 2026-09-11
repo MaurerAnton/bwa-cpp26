@@ -361,6 +361,104 @@ int main() {
         std::remove(fa_path);
     }
 
+    // -x read-type presets set seed/scoring values; unknown names fail.
+    {
+        Config c = Config::default_mem();
+        test("Preset ont2d", c.apply_preset("ont2d") && c.min_seed_len == 14 &&
+                             c.scoring.mismatch == -1 && c.scoring.clip_pen == 0);
+        c = Config::default_mem();
+        test("Preset pacbio", c.apply_preset("pacbio") && c.min_seed_len == 17 &&
+                              c.scoring.gap_open == -1);
+        c = Config::default_mem();
+        test("Preset intractable", c.apply_preset("intractable") &&
+                                    c.min_seed_len == 19 &&
+                                    c.scoring.mismatch == -4);
+        c = Config::default_mem();
+        test("Preset unknown", !c.apply_preset("bogus") && c.min_seed_len == 9);
+    }
+
+    // Asymmetric chimera: a 25 bp segment on chrY (ref 1) and a 20 bp
+    // segment on chrX (ref 0). Score picks chrY as primary by default;
+    // -5 promotes the smaller-coordinate chrX hit to primary (soft-clipped,
+    // full SEQ) and demotes chrY to hard-clipped supplementary. -Y keeps
+    // soft clips (and full SEQ) on the supplementary instead.
+    {
+        const char* fa_path = "/tmp/bwa_test_chimera5.fa";
+        const std::string segA = "AATTACATAACATACACGTCTAGCT";  // 25 bp, chrY
+        const std::string segB = "GCTGTGTCCACCCCATCGGA";       // 20 bp, chrX
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrX\n" << std::string(30, 'G') << segB
+               << std::string(30, 'G') << "\n";
+            fa << ">chrY\n" << std::string(30, 'C') << segA
+               << std::string(30, 'C') << "\n";
+        }
+        Index idx = Index::build(fa_path);
+
+        io::SeqRecord asym;
+        asym.name = "asym";
+        asym.seq = segA + segB;
+        asym.qual = std::string(45, 'I');
+
+        auto has_hard_clip = [](const AlnRecord& a) {
+            if (a.cigar.empty()) return false;
+            auto op = align::cigar_op(a.cigar.front());
+            if (op == align::CigarOp::HardClip) return true;
+            op = align::cigar_op(a.cigar.back());
+            return op == align::CigarOp::HardClip;
+        };
+
+        // Default: chrY (higher SW score) is primary.
+        {
+            Aligner aligner(idx);
+            AlignmentResult res = aligner.align(asym);
+            test("Asym mapped", res.mapped && res.supplementary.size() == 1);
+            if (res.mapped && res.supplementary.size() == 1) {
+                test("Asym primary", res.primary.rname == "chrY");
+                test("Asym supp", res.supplementary[0].rname == "chrX");
+                test("Asym supp hard clip",
+                     has_hard_clip(res.supplementary[0]));
+                test("Asym supp trimmed",
+                     res.supplementary[0].seq.size() == 20);
+            }
+        }
+
+        // -5: chrX (smaller ref id) becomes primary with full SEQ.
+        {
+            Config cfg = Config::default_mem();
+            cfg.smallest_coord_primary = true;
+            Aligner aligner(idx, cfg);
+            AlignmentResult res = aligner.align(asym);
+            test("Minus5 mapped", res.mapped && res.supplementary.size() == 1);
+            if (res.mapped && res.supplementary.size() == 1) {
+                test("Minus5 primary", res.primary.rname == "chrX");
+                test("Minus5 primary full seq", res.primary.seq.size() == 45);
+                test("Minus5 supp", res.supplementary[0].rname == "chrY");
+                test("Minus5 supp hard clip",
+                     has_hard_clip(res.supplementary[0]));
+                test("Minus5 supp trimmed",
+                     res.supplementary[0].seq.size() == 25);
+            }
+        }
+
+        // -Y: supplementary keeps soft clips and full SEQ.
+        {
+            Config cfg = Config::default_mem();
+            cfg.soft_clip_supplementary = true;
+            Aligner aligner(idx, cfg);
+            AlignmentResult res = aligner.align(asym);
+            test("SoftY mapped", res.mapped && res.supplementary.size() == 1);
+            if (res.mapped && res.supplementary.size() == 1) {
+                test("SoftY no hard clip",
+                     !has_hard_clip(res.supplementary[0]));
+                test("SoftY full seq",
+                     res.supplementary[0].seq.size() == 45);
+            }
+        }
+
+        std::remove(fa_path);
+    }
+
     // N-containing reference: flanking matches must survive the N-run,
     // and the save/load roundtrip must preserve N-ness (v2 format).
     {
