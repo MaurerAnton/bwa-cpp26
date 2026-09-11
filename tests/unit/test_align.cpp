@@ -367,14 +367,14 @@ int main() {
                  (rres2.primary.flag & AlnRecord::F_REVERSE) != 0);
             test("Rescue pos",
                  rres2.primary.pos >= 1490 && rres2.primary.pos <= 1510);
-            // FR orientation, correct order: proper pair. TLEN is 799, not
-            // 800, because the mutated first base soft-clips (1S), shifting
-            // the reverse 5' end one base left.
+            // FR orientation, correct order: proper pair with TLEN +/-800.
+            // (The clipping penalty keeps the end-to-end alignment despite
+            // the mutated first base, so no soft clip shifts the 5' end.)
             test("Rescue proper",
                  (rres1.primary.flag & AlnRecord::F_PROPER_PAIR) != 0 &&
                  (rres2.primary.flag & AlnRecord::F_PROPER_PAIR) != 0);
             test("Rescue tlen",
-                 rres1.primary.tlen == 799 && rres2.primary.tlen == -799);
+                 rres1.primary.tlen == 800 && rres2.primary.tlen == -800);
         }
 
         std::remove(fa_path);
