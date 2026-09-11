@@ -176,7 +176,11 @@ AGPL-3.0-only - Same as original BWA.
 - [x] Supplementary alignment (SA tag)
 - [x] Proper paired-end (FR proper-pair flags, TLEN, mate rescue)
 - [x] Insert-size distribution estimation (sampled, trimmed moments)
-- [ ] Base quality recalibration
+
+Out of scope (not part of BWA-MEM; listed here to avoid confusion):
+- Base quality recalibration (a GATK-style post-processing step; BWA
+  ignores base qualities in scoring, and so do we)
+- Reading BWA-format index files (ours are faster to build anyway)
 
 ## Performance notes
 

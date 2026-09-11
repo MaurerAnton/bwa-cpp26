@@ -44,38 +44,48 @@ def mutate_read(seq, error_rate=0.01, indel_rate=0.001):
             i += 1
     return ''.join(result)
 
-def simulate_reads(reference, num_reads, read_len, error_rate=0.01, seed=42):
-    """Generate simulated reads with ground truth."""
+def simulate_reads(reference, num_reads, read_len, error_rate=0.01, seed=42,
+                   unique_only=False):
+    """Generate simulated reads with ground truth.
+
+    By default positions are uniform random (fast: O(num_reads)). With
+    unique_only=True, reads are restricted to regions where every 20-mer is
+    unique; that filter is O(ref_len * read_len) and very slow on megabase
+    references, so it is opt-in.
+    """
     random.seed(seed)
     ref_len = len(reference)
-    
-    # Precompute unique 20-mers to find mappable regions
-    kmer_size = 20
-    kmer_counts = {}
-    for i in range(len(reference) - kmer_size + 1):
-        kmer = reference[i:i+kmer_size]
-        kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
-    
-    # Find uniquely mappable positions (all 20-mers in the read are unique)
-    mappable = [False] * ref_len
-    for i in range(ref_len - read_len + 1):
-        unique = True
-        for k in range(read_len - kmer_size + 1):
-            kmer = reference[i+k:i+k+kmer_size]
-            if kmer_counts.get(kmer, 0) > 1:
-                unique = False
-                break
-        if unique:
-            for j in range(read_len):
-                mappable[i+j] = True
-    
-    # Find all valid start positions
-    valid_starts = [i for i in range(ref_len - read_len + 1) if mappable[i]]
-    
-    if not valid_starts:
-        # Fallback: use all positions
-        valid_starts = list(range(ref_len - read_len + 1))
-        print(f"Warning: No uniquely mappable regions found, using all positions")
+
+    if unique_only:
+        # Precompute unique 20-mers to find mappable regions
+        kmer_size = 20
+        kmer_counts = {}
+        for i in range(len(reference) - kmer_size + 1):
+            kmer = reference[i:i+kmer_size]
+            kmer_counts[kmer] = kmer_counts.get(kmer, 0) + 1
+
+        # Find uniquely mappable positions (all 20-mers in the read are unique)
+        mappable = [False] * ref_len
+        for i in range(ref_len - read_len + 1):
+            unique = True
+            for k in range(read_len - kmer_size + 1):
+                kmer = reference[i+k:i+k+kmer_size]
+                if kmer_counts.get(kmer, 0) > 1:
+                    unique = False
+                    break
+            if unique:
+                for j in range(read_len):
+                    mappable[i+j] = True
+
+        # Find all valid start positions
+        valid_starts = [i for i in range(ref_len - read_len + 1) if mappable[i]]
+
+        if not valid_starts:
+            # Fallback: use all positions
+            valid_starts = list(range(ref_len - read_len + 1))
+            print(f"Warning: No uniquely mappable regions found, using all positions")
+    else:
+        valid_starts = range(ref_len - read_len + 1)
     
     reads = []
     ground_truth = []
@@ -93,8 +103,8 @@ def simulate_reads(reference, num_reads, read_len, error_rate=0.01, seed=42):
         
         read_seq = mutate_read(true_seq, error_rate)
         
-        # Quality string
-        qual = ''.join(chr(min(40, max(2, int(-10 * math.log10(error_rate) + random.gauss(0, 5))))) for _ in read_seq)
+        # Quality string (Phred+33 ASCII, as FASTQ requires)
+        qual = ''.join(chr(min(40, max(2, int(-10 * math.log10(error_rate) + random.gauss(0, 5)))) + 33) for _ in read_seq)
         
         reads.append({
             'name': f'read_{len(reads)}',
@@ -204,6 +214,9 @@ def main():
     parser.add_argument('--read-len', type=int, default=150)
     parser.add_argument('--error-rate', type=float, default=0.01)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--unique-only', action='store_true',
+                        help='restrict reads to uniquely mappable regions '
+                             '(slow on large references)')
     parser.add_argument('--bwa-cpp', default='./build/src/bwa')
     parser.add_argument('--bwa-sys', default='bwa')
     parser.add_argument('--out-dir', default='/tmp/bwa_validation')
@@ -222,7 +235,9 @@ def main():
     print(f"Generating {args.num_reads} reads of length {args.read_len}...")
     
     # Simulate reads
-    reads, ground_truth = simulate_reads(ref_seq, args.num_reads, args.read_len, args.error_rate, args.seed)
+    reads, ground_truth = simulate_reads(ref_seq, args.num_reads, args.read_len,
+                                         args.error_rate, args.seed,
+                                         args.unique_only)
     print(f"Generated {len(reads)} reads")
     
     # Write FASTA
