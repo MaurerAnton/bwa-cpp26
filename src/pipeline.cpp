@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
+#include <iterator>
+#include <thread>
 #include <map>
 #include <sstream>
 
@@ -1123,6 +1125,101 @@ void append_bam_entry(std::vector<BamEntry>& out, const AlnRecord& a,
     out.push_back(std::move(e));
 }
 
+// Emit one result's records (primary + enabled alternates) into out.
+void emit_result_bam(const AlignmentResult& result, const Index& index,
+                     const Config& config, std::vector<BamEntry>& out) {
+    append_bam_entry(out, result.primary, index, config.mark_split_secondary);
+    if (config.output_secondary) {
+        for (const auto& s : result.secondary) {
+            append_bam_entry(out, s, index, config.mark_split_secondary);
+        }
+    }
+    if (config.output_supplementary) {
+        for (const auto& s : result.supplementary) {
+            append_bam_entry(out, s, index, config.mark_split_secondary);
+        }
+    }
+}
+
+// Chunked parallel single-end collection. Each worker owns an Aligner (with
+// the caller's insert stats) and a private entry vector; order is irrelevant
+// because write_bam_records coordinate-sorts.
+void collect_single_bam(const Index& index, const Config& config,
+                        const InsertSizeStats& stats,
+                        const io::SeqRecord* reads, size_t n,
+                        std::vector<BamEntry>& out) {
+    const int T = std::max(1, config.num_threads);
+    if (T == 1 || n <= 1) {
+        Aligner al(index, config);
+        al.set_insert_stats(stats);
+        for (size_t i = 0; i < n; ++i) {
+            emit_result_bam(al.align(reads[i]), index, config, out);
+        }
+        return;
+    }
+    std::vector<std::vector<BamEntry>> partial(static_cast<size_t>(T));
+    std::atomic<size_t> next{0};
+    auto worker = [&](int t) {
+        Aligner local(index, config);
+        local.set_insert_stats(stats);
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            emit_result_bam(local.align(reads[i]), index, config,
+                            partial[static_cast<size_t>(t)]);
+            memory::reset_tls_arena();
+        }
+    };
+    std::vector<std::thread> threads;
+    const int nt = static_cast<int>(std::min<size_t>(static_cast<size_t>(T), n));
+    for (int t = 0; t < nt; ++t) threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    for (auto& p : partial) {
+        out.insert(out.end(), std::make_move_iterator(p.begin()),
+                   std::make_move_iterator(p.end()));
+    }
+}
+
+// Chunked parallel paired-end collection (same scheme as above).
+void collect_pair_bam(const Index& index, const Config& config,
+                      const InsertSizeStats& stats,
+                      const io::SeqRecord* read1, const io::SeqRecord* read2,
+                      size_t n, std::vector<BamEntry>& out) {
+    const int T = std::max(1, config.num_threads);
+    if (T == 1 || n <= 1) {
+        Aligner al(index, config);
+        al.set_insert_stats(stats);
+        for (size_t i = 0; i < n; ++i) {
+            auto [res1, res2] = al.align_pair(read1[i], read2[i]);
+            emit_result_bam(res1, index, config, out);
+            emit_result_bam(res2, index, config, out);
+        }
+        return;
+    }
+    std::vector<std::vector<BamEntry>> partial(static_cast<size_t>(T));
+    std::atomic<size_t> next{0};
+    auto worker = [&](int t) {
+        Aligner local(index, config);
+        local.set_insert_stats(stats);
+        for (;;) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            auto [res1, res2] = local.align_pair(read1[i], read2[i]);
+            emit_result_bam(res1, index, config, partial[static_cast<size_t>(t)]);
+            emit_result_bam(res2, index, config, partial[static_cast<size_t>(t)]);
+            memory::reset_tls_arena();
+        }
+    };
+    std::vector<std::thread> threads;
+    const int nt = static_cast<int>(std::min<size_t>(static_cast<size_t>(T), n));
+    for (int t = 0; t < nt; ++t) threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    for (auto& p : partial) {
+        out.insert(out.end(), std::make_move_iterator(p.begin()),
+                   std::make_move_iterator(p.end()));
+    }
+}
+
 // Coordinate-sort records, then write BAM + BAI. The BAI requires
 // coordinate order, so records are buffered first (memory scales with the
 // number of alignments).
@@ -1265,15 +1362,17 @@ void Pipeline::ensure_insert_size(const char* fastq1, const char* fastq2) const 
 void Pipeline::align_to_bam(const char* fastq_path, const char* bam_path) const {
     std::vector<BamEntry> recs;
     io::SeqReader reader(fastq_path);
-    aligner_.align_stream(reader, [&](const AlignmentResult& result) {
-        append_bam_entry(recs, result.primary, index_, config_.mark_split_secondary);
-        if (config_.output_secondary) {
-            for (const auto& s : result.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
-        if (config_.output_supplementary) {
-            for (const auto& s : result.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
-    });
+    const size_t chunk =
+        std::max<size_t>(static_cast<size_t>(config_.batch_size), 64);
+    std::vector<io::SeqRecord> reads(chunk);
+    for (;;) {
+        size_t n = 0;
+        while (n < chunk && reader.read(reads[n])) ++n;
+        if (n == 0) break;
+        collect_single_bam(index_, config_, aligner_.insert_stats(), reads.data(),
+                           n, recs);
+        memory::reset_tls_arena();
+    }
     write_bam_records(index_, config_, recs, bam_path);
 }
 
@@ -1282,19 +1381,15 @@ void Pipeline::align_pair_to_bam(const char* fastq1, const char* fastq2,
     ensure_insert_size(fastq1, fastq2);
     std::vector<BamEntry> recs;
     io::SeqReader r1(fastq1), r2(fastq2);
-    io::SeqRecord read1, read2;
-    while (r1.read(read1) && r2.read(read2)) {
-        auto [res1, res2] = aligner_.align_pair(read1, read2);
-        append_bam_entry(recs, res1.primary, index_, config_.mark_split_secondary);
-        append_bam_entry(recs, res2.primary, index_, config_.mark_split_secondary);
-        if (config_.output_secondary) {
-            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
-        if (config_.output_supplementary) {
-            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
+    const size_t chunk =
+        std::max<size_t>(static_cast<size_t>(config_.batch_size), 64);
+    std::vector<io::SeqRecord> reads1(chunk), reads2(chunk);
+    for (;;) {
+        size_t n = 0;
+        while (n < chunk && r1.read(reads1[n]) && r2.read(reads2[n])) ++n;
+        if (n == 0) break;
+        collect_pair_bam(index_, config_, aligner_.insert_stats(), reads1.data(),
+                         reads2.data(), n, recs);
         memory::reset_tls_arena();
     }
     write_bam_records(index_, config_, recs, bam_path);
@@ -1304,19 +1399,15 @@ void Pipeline::align_pair_interleaved_bam(const char* fastq, const char* bam_pat
     ensure_insert_size(fastq, nullptr);
     std::vector<BamEntry> recs;
     io::SeqReader reader(fastq);
-    io::SeqRecord read1, read2;
-    while (reader.read(read1) && reader.read(read2)) {
-        auto [res1, res2] = aligner_.align_pair(read1, read2);
-        append_bam_entry(recs, res1.primary, index_, config_.mark_split_secondary);
-        append_bam_entry(recs, res2.primary, index_, config_.mark_split_secondary);
-        if (config_.output_secondary) {
-            for (const auto& s : res1.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-            for (const auto& s : res2.secondary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
-        if (config_.output_supplementary) {
-            for (const auto& s : res1.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-            for (const auto& s : res2.supplementary) append_bam_entry(recs, s, index_, config_.mark_split_secondary);
-        }
+    const size_t chunk =
+        std::max<size_t>(static_cast<size_t>(config_.batch_size), 64);
+    std::vector<io::SeqRecord> reads1(chunk), reads2(chunk);
+    for (;;) {
+        size_t n = 0;
+        while (n < chunk && reader.read(reads1[n]) && reader.read(reads2[n])) ++n;
+        if (n == 0) break;
+        collect_pair_bam(index_, config_, aligner_.insert_stats(), reads1.data(),
+                         reads2.data(), n, recs);
         memory::reset_tls_arena();
     }
     write_bam_records(index_, config_, recs, bam_path);
