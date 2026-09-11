@@ -309,6 +309,77 @@ int main() {
         std::remove(fa_path);
     }
 
+    // Mate rescue: a long end too diverged to seed (errors every 4th base
+    // defeat exact and 1-mismatch 9-mer seeds) must still be recovered by
+    // targeted extension around its mapped mate.
+    {
+        const char* fa_path = "/tmp/bwa_test_rescue.fa";
+        // Deterministic pseudo-random reference, 10000 bp.
+        std::string ref;
+        ref.reserve(10000);
+        uint32_t x = 987654321u;
+        for (int i = 0; i < 10000; ++i) {
+            x = x * 1664525u + 1013904223u;
+            ref += "ACGT"[(x >> 16) & 3];
+        }
+        {
+            std::ofstream fa(fa_path);
+            fa << ">chrR\n" << ref << "\n";
+        }
+        Index idx = Index::build(fa_path);
+        Aligner aligner(idx);
+
+        // Mate: perfect 150-mer at offset 1000 (forward).
+        io::SeqRecord mate;
+        mate.name = "rescue/1";
+        mate.seq = ref.substr(1000, 150);
+        mate.qual = std::string(150, 'I');
+
+        // Diverged 300-mer from offset 1500: RC (reverse strand) with every
+        // 4th base substituted, so no 9-mer seed (exact or 1-mismatch) hits.
+        std::string seg = ref.substr(1500, 300);
+        std::string rc;
+        rc.reserve(300);
+        for (auto it = seg.rbegin(); it != seg.rend(); ++it) {
+            char c = *it;
+            rc += (c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A');
+        }
+        for (size_t i = 0; i < rc.size(); i += 4) {
+            rc[i] = rc[i] == 'A' ? 'C' : 'A';
+        }
+        io::SeqRecord div;
+        div.name = "rescue/2";
+        div.seq = rc;
+        div.qual = std::string(300, 'I');
+
+        // Sanity: the diverged end alone must not map (else this isn't a
+        // rescue test at all).
+        AlignmentResult solo = aligner.align(div);
+        test("Rescue solo unmapped", !solo.mapped);
+
+        auto [rres1, rres2] = aligner.align_pair(mate, div);
+        test("Rescue mate mapped", rres1.mapped);
+        test("Rescue recovered", rres2.mapped);
+        if (rres2.mapped) {
+            test("Rescue rname", rres2.primary.rname == "chrR");
+            // Reverse-strand placement at the true locus (1-based 1501).
+            test("Rescue reverse",
+                 (rres2.primary.flag & AlnRecord::F_REVERSE) != 0);
+            test("Rescue pos",
+                 rres2.primary.pos >= 1490 && rres2.primary.pos <= 1510);
+            // FR orientation, correct order: proper pair. TLEN is 799, not
+            // 800, because the mutated first base soft-clips (1S), shifting
+            // the reverse 5' end one base left.
+            test("Rescue proper",
+                 (rres1.primary.flag & AlnRecord::F_PROPER_PAIR) != 0 &&
+                 (rres2.primary.flag & AlnRecord::F_PROPER_PAIR) != 0);
+            test("Rescue tlen",
+                 rres1.primary.tlen == 799 && rres2.primary.tlen == -799);
+        }
+
+        std::remove(fa_path);
+    }
+
     // Chimeric (split) read: two segments from different references must
     // produce a soft-clipped primary plus a hard-clipped supplementary with
     // reciprocal SA:Z tags.

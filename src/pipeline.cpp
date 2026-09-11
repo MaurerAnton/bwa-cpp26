@@ -47,6 +47,17 @@ inline bool chain_is_reverse(const bwa::align::MEMFinder::Chain& chain) {
     return rev > fwd;
 }
 
+// Effective config for a read length: very long reads auto-switch to the
+// long-read preset (unless a read group pins the config). Shared by the
+// main alignment and mate rescue so both use the same scoring.
+inline Config effective_config_for(const Config& config,
+                                   int32_t query_len) noexcept {
+    if (query_len > 250 && !config.read_group.has_value()) {
+        return Config::long_reads();
+    }
+    return config;
+}
+
 // Helper: format SAM CIGAR from encoded cigar vector
 std::string format_cigar(const std::vector<uint32_t>& cigar) {
     std::string s;
@@ -83,12 +94,8 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
     };
 
     // Determine effective config based on read length
-    Config effective_config = config_;
     int32_t query_len = static_cast<int32_t>(read.seq.size());
-    if (query_len > 250 && !config_.read_group.has_value()) {
-        // Auto-switch to long-read config for very long reads
-        effective_config = Config::long_reads();
-    }
+    Config effective_config = effective_config_for(config_, query_len);
 
     // Pack query sequence
     bwa::index::PackedSequence query;
@@ -693,20 +700,21 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
     bwa::align::Alignment best;
     bool best_rev = false;
     bool have = false;
+    const Config eff = effective_config_for(config_, qlen);
     for (int s = 0; s < 2; ++s) {
         const uint8_t* qptr = s == 0 ? qfwd.data() : qrc.data();
         auto aln = bwa::align::sw_semi_global_extend(
-            config_.scoring,
+            eff.scoring,
             std::span<const uint8_t>(qptr, qlen),
             std::span<const uint8_t>(ref_region.data(), ref_region.size()),
-            config_.band_width);
+            eff.band_width);
         if (!have || aln.score > best.score) {
             best = std::move(aln);
             best_rev = (s == 1);
             have = true;
         }
     }
-    if (!have || best.score < config_.min_chain_score) return false;
+    if (!have || best.score < eff.min_chain_score) return false;
 
     AlnRecord rec;
     rec.qname = std::string(read.name);
