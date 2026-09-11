@@ -149,15 +149,7 @@ public:
                 }
 
                 if (r > l && r - l <= static_cast<size_t>(max_occ_rescue)) {
-                    if (auto pos = fm_index_.locate(l)) {
-                        MEM mem;
-                        mem.query_pos = i;
-                        mem.ref_pos = *pos;
-                        mem.len = rescue_k;
-                        mem.score = rescue_k * match_score_;
-                        mem.is_forward = is_fwd;
-                        mems.push_back(mem);
-                    }
+                    emit_mems(mems, i, rescue_k, l, r, is_fwd);
                 }
             }
         }
@@ -199,17 +191,10 @@ public:
             }
 
             if (r > l && r - l <= static_cast<size_t>(max_occ_)) {
-                // Exact match found
-                if (auto pos = fm_index_.locate(l)) {
-                    MEM mem;
-                    mem.query_pos = i;
-                    mem.ref_pos = *pos;
-                    mem.len = min_seed_len_;
-                    mem.score = min_seed_len_ * match_score_;
-                    mem.is_forward = is_fwd;
-                    mems.push_back(mem);
-                    covered[i] = true;
-                }
+                // Exact match found (all occurrences, capped)
+                size_t before = mems.size();
+                emit_mems(mems, i, min_seed_len_, l, r, is_fwd);
+                if (mems.size() > before) covered[i] = true;
             } else {
                 // Try 1-mismatch seeds
                 for (int mm_pos = 0; mm_pos < min_seed_len_; ++mm_pos) {
@@ -227,16 +212,11 @@ public:
                         if (!ok) continue;
                         if (r - l > static_cast<size_t>(max_occ_)) continue;
 
-                        if (auto pos = fm_index_.locate(l)) {
-                            MEM mem;
-                            mem.query_pos = i;
-                            mem.ref_pos = *pos;
-                            mem.len = min_seed_len_;
-                            mem.score = min_seed_len_ * match_score_;
-                            mem.is_forward = is_fwd;
-                            mems.push_back(mem);
+                        size_t before = mems.size();
+                        emit_mems(mems, i, min_seed_len_, l, r, is_fwd);
+                        if (mems.size() > before) {
                             covered[i] = true;
-                            break;  // Found a match for this position
+                            break;  // Found matches for this position
                         }
                     }
                     if (covered[i]) break;
@@ -245,11 +225,51 @@ public:
         }
     }
 
+    // Max occurrences materialized per seed. BWA retrieves up to max_occ
+    // positions; we cap lower because only the count (for MAPQ ambiguity)
+    // and a few representatives (for chaining) matter, while the DP cost
+    // grows with the square of the MEM count.
+    static constexpr int32_t kMaxOccPerSeed = 32;
+    // Hard cap on MEMs per find() call to bound chaining cost on
+    // pathological repeat reads.
+    static constexpr size_t kMaxMemsTotal = 4096;
+    // Only seeds at least this multiple of min_seed_len fan out to multiple
+    // occurrences. Short (e.g. 9-mer inexact) seeds in repeats would
+    // otherwise multiply MEM counts for weak evidence; long multi-occurrence
+    // seeds are the meaningful repeat indicators that drive MAPQ.
+    static constexpr int32_t kFanoutLenFactor = 2;
+
+    // Emit one MEM per located occurrence (up to kMaxOccPerSeed rows),
+    // sharing the same query span. Different loci become separate chains,
+    // which is what drives MAPQ down for repeats (BWA sub_n equivalent).
+    void emit_mems(core::Vector<MEM>& mems, int32_t query_pos, int32_t len,
+                   size_t row_l, size_t row_r, bool is_fwd) const {
+        size_t occ = row_r > row_l ? row_r - row_l : 0;
+        size_t n = occ;
+        if (len < kFanoutLenFactor * min_seed_len_) {
+            // Short seed: single representative (avoids fan-out blowup).
+            n = occ > 0 ? 1 : 0;
+        } else if (n > static_cast<size_t>(kMaxOccPerSeed)) {
+            n = static_cast<size_t>(kMaxOccPerSeed);
+        }
+        for (size_t k = 0; k < n; ++k) {
+            if (mems.size() >= kMaxMemsTotal) return;
+            auto pos = fm_index_.locate(row_l + k);
+            if (!pos) continue;
+            MEM mem;
+            mem.query_pos = query_pos;
+            mem.ref_pos = static_cast<int32_t>(*pos);
+            mem.len = len;
+            mem.score = len * match_score_;
+            mem.is_forward = is_fwd;
+            mems.push_back(mem);
+        }
+    }
+
     // Find MEMs using SMEM (simple maximal exact matches) algorithm
     void find_strand(const std::span<const uint8_t>& query,
                      core::Vector<MEM>& mems,
-                     bool is_fwd) const {
-        int32_t qlen = static_cast<int32_t>(query.size());
+                     bool is_fwd) const {        int32_t qlen = static_cast<int32_t>(query.size());
         if (qlen < min_seed_len_) return;
 
         // Use backward search: process query from right to left
@@ -281,16 +301,11 @@ public:
 
             int32_t mem_len = i - best_j;
             if (mem_len >= min_seed_len_) {
-                // Get reference position (sampled SA)
-                if (auto pos = fm_index_.locate(best_l)) {
-                    MEM mem;
-                    mem.query_pos = best_j + 1;
-                    mem.ref_pos = *pos;
-                    mem.len = mem_len;
-                    mem.score = mem_len * match_score_;
-                    mem.is_forward = is_fwd;
-                    mems.push_back(mem);
-                }
+                // Retrieve all occurrences (capped): repeat copies become
+                // separate MEMs at distinct loci instead of one arbitrary hit.
+                emit_mems(mems, best_j + 1, mem_len,
+                          static_cast<size_t>(best_l),
+                          static_cast<size_t>(best_r), is_fwd);
             }
 
             // Move to next position (from right)
@@ -334,8 +349,15 @@ public:
                     contained = true;
                     break;
                 }
-                // Check overlap
-                if (mem.query_pos < kept.query_end() && mem.query_end() > kept.query_pos) {
+                // Suppress on query overlap only when the two MEMs also
+                // overlap in reference (same locus). Same-query-span MEMs at
+                // distinct loci are repeat copies: keeping them is what lets
+                // chaining report competing placements and MAPQ reflect the
+                // ambiguity (BWA sub_n equivalent). Previously the reference
+                // check was missing, so repeats collapsed to one arbitrary
+                // copy reported with MAPQ 60.
+                if (mem.query_pos < kept.query_end() && mem.query_end() > kept.query_pos &&
+                    mem.ref_pos < kept.ref_end() && mem.ref_end() > kept.ref_pos) {
                     // Overlap - keep higher score
                     if (mem.score <= kept.score) {
                         contained = true;

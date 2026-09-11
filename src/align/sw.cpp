@@ -228,6 +228,107 @@ Alignment sw_semi_global_extend(const Scoring& sc,
     aln.ref_begin = tj;
     aln.ref_end = best_j;
 
+    // BWA-style clipping penalty (-L): prefer the full-query alignment
+    // unless clipping gains more than the penalty. Pure local alignment
+    // clips read ends for marginal gains (e.g. clipping 8 bp to dodge 2
+    // mismatches), diverging from BWA's end-to-end placements. The forced
+    // extension is scored ungapped (conservative: true gapped extension can
+    // only score higher, so we only override when clearly beneficial).
+    const int32_t clip_mag = sc.clip_pen < 0 ? -sc.clip_pen : 0;
+    if (clip_mag > 0 && (ti > 0 || best_i < qlen)) {
+        const int32_t pre_start = tj - ti;
+        const int32_t suf_end = best_j + (qlen - best_i);
+        if ((!ti || pre_start >= 0) && (best_i >= qlen || suf_end <= rlen)) {
+            auto base_ok = [&](int32_t qpos, int32_t rpos) {
+                return query[qpos] == ref[rpos] && query[qpos] < 4;
+            };
+            int32_t forced = best_score;
+            for (int32_t k = 0; k < ti; ++k) {
+                forced += base_ok(k, pre_start + k) ? sc.match : sc.mismatch;
+            }
+            for (int32_t k = best_i; k < qlen; ++k) {
+                forced += base_ok(k, best_j + (k - best_i)) ? sc.match : sc.mismatch;
+            }
+            int32_t penalty =
+                (ti > 0 ? clip_mag : 0) + (best_i < qlen ? clip_mag : 0);
+            if (forced + penalty >= best_score) {
+                // Rebuild as a full-query CIGAR, merging edge runs.
+                std::vector<uint32_t> full;
+                auto push_run = [&](detail::CigarOp op, int32_t len) {
+                    if (len <= 0) return;
+                    if (!full.empty() &&
+                        static_cast<detail::CigarOp>(full.back() & 0xF) == op &&
+                        static_cast<int32_t>(full.back() >> 4) + len <= 0xFFF) {
+                        uint32_t back = full.back();
+                        full.pop_back();
+                        full.push_back(detail::encode_cigar(
+                            static_cast<int32_t>(back >> 4) + len, op));
+                    } else {
+                        full.push_back(detail::encode_cigar(len, op));
+                    }
+                };
+                {
+                    int32_t run = 0;
+                    detail::CigarOp rop = detail::CigarOp::Equal;
+                    bool hr = false;
+                    for (int32_t k = 0; k < ti; ++k) {
+                        auto op = base_ok(k, pre_start + k)
+                                      ? detail::CigarOp::Equal
+                                      : detail::CigarOp::Diff;
+                        if (!hr) {
+                            rop = op;
+                            run = 1;
+                            hr = true;
+                        } else if (op == rop) {
+                            ++run;
+                        } else {
+                            push_run(rop, run);
+                            rop = op;
+                            run = 1;
+                        }
+                    }
+                    if (hr) push_run(rop, run);
+                }
+                for (uint32_t c : aln.cigar) {
+                    auto op = static_cast<detail::CigarOp>(c & 0xF);
+                    if (op == detail::CigarOp::SoftClip ||
+                        op == detail::CigarOp::HardClip) {
+                        continue;
+                    }
+                    push_run(op, static_cast<int32_t>(c >> 4));
+                }
+                {
+                    int32_t run = 0;
+                    detail::CigarOp rop = detail::CigarOp::Equal;
+                    bool hr = false;
+                    for (int32_t k = best_i; k < qlen; ++k) {
+                        auto op = base_ok(k, best_j + (k - best_i))
+                                      ? detail::CigarOp::Equal
+                                      : detail::CigarOp::Diff;
+                        if (!hr) {
+                            rop = op;
+                            run = 1;
+                            hr = true;
+                        } else if (op == rop) {
+                            ++run;
+                        } else {
+                            push_run(rop, run);
+                            rop = op;
+                            run = 1;
+                        }
+                    }
+                    if (hr) push_run(rop, run);
+                }
+                aln.cigar = std::move(full);
+                aln.score = forced;
+                aln.query_begin = 0;
+                aln.query_end = qlen;
+                aln.ref_begin = ti > 0 ? pre_start : tj;
+                aln.ref_end = best_i < qlen ? suf_end : best_j;
+            }
+        }
+    }
+
     // Count mismatches
     aln.n_mismatch = aln.n_gap_open = aln.n_gap_ext = 0;
     for (uint32_t c : aln.cigar) {

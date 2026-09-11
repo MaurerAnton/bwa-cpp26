@@ -13,7 +13,9 @@ out/
 *.so.*
 
 # Linked binaries (the bwa executables live under build dirs)
-bwa
+# Linked binaries (anchored: the bwa executables live under build dirs,
+# but a stray top-level link should also stay out of git)
+/bwa
 bwa-test-*
 bwa-bench-*
 
