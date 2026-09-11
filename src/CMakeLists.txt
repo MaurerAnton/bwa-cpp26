@@ -74,7 +74,7 @@ target_link_libraries(bwa PRIVATE
 )
 
 # Tests (one binary per suite: each test file defines its own main())
-foreach(_t core index align)
+foreach(_t core index align fuzz)
     add_executable(bwa-test-${_t} ../tests/unit/test_${_t}.cpp)
     target_link_libraries(bwa-test-${_t} PRIVATE
         bwa-core bwa-index bwa-align bwa-io bwa-pipeline bwa-utils
