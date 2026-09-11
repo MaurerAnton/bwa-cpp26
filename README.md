@@ -185,7 +185,7 @@ AGPL-3.0-only - Same as original BWA.
   Sanitizers are enabled by default for unoptimized builds and cost
   ~10-15x at runtime.
 - Reference points (E. coli K-12, 4.6 MB, 4-core machine): index build
-  ~16 s; 2000 simulated 150-mers with 1% error align in ~5.6 s
+  ~12 s; 2000 simulated 150-mers with 1% error align in ~5.6 s
   (~2.8 ms/read) single-threaded; 0 unmapped, 1978/2000 within 5 bp of
   truth, 1983 MAPQ60.
 - 1000 simulated 350 bp-insert pairs: 98.9% flagged proper pair with

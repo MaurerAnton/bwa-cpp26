@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 
 namespace bwa::index::detail::sais {
 
@@ -40,21 +41,24 @@ inline void find_lms_positions(const uint8_t* t, int32_t n,
 
 // Compare two LMS substrings: equal chars up to and including the next LMS
 // boundary on both sides. Used only to name substrings, never past n.
+//
+// Fast path: find both substring ends with a cheap type-byte scan, then
+// compare the bodies with memcmp. This is exactly equivalent to the naive
+// loop (which compared the same [start, next-LMS) ranges char by char and
+// never compared the endpoint LMS chars): differing lengths imply a
+// boundary mismatch at the shorter end, and equal lengths reduce to body
+// equality. On repetitive DNA the naive loop was the index-build bottleneck
+// (long near-identical LMS substrings compared bytewise).
 inline bool lms_substrings_equal(const int32_t* T, const uint8_t* t,
                                  int32_t i, int32_t j, int32_t n) noexcept {
     if (i == j) return true;
     if (i >= n - 1 || j >= n - 1) return i == j;
-
-    int32_t k = 0;
-    while (true) {
-        bool i_lms = (k > 0) && (t[i + k] == S_TYPE) && (t[i + k - 1] == L_TYPE);
-        bool j_lms = (k > 0) && (t[j + k] == S_TYPE) && (t[j + k - 1] == L_TYPE);
-        if (k > 0 && i_lms && j_lms) return true;
-        if (i_lms != j_lms) return false;
-        if (T[i + k] != T[j + k]) return false;
-        ++k;
-        if (i + k >= n || j + k >= n) return i + k == n && j + k == n;
-    }
+    int32_t i2 = i + 1;
+    while (i2 < n && !(t[i2] == S_TYPE && t[i2 - 1] == L_TYPE)) ++i2;
+    int32_t j2 = j + 1;
+    while (j2 < n && !(t[j2] == S_TYPE && t[j2 - 1] == L_TYPE)) ++j2;
+    if (i2 - i != j2 - j) return false;
+    return std::memcmp(&T[i], &T[j], static_cast<size_t>(i2 - i) * 4) == 0;
 }
 
 // Bucket boundaries: starts[c] = first index of char c, ends[c] = one past
