@@ -400,6 +400,13 @@ int main(int argc, char* argv[]) {
             } else if (a == "-T") {
                 int v = 0;
                 if (parse_int(value("-T"), v)) cfg.min_output_score = v;
+            } else if (a == "-h") {
+                // XA tag thresholds: INT[,INT] (max hits to list, cap).
+                int h1 = 0, h2 = 0;
+                if (parse_pair(value("-h"), h1, h2) && h1 > 0) {
+                    cfg.output_xa = true;
+                    cfg.xa_max_hits = h1;
+                }
             } else if (a == "-R") {
                 // Accept '@RG\tID:..\tSM:..' (literal backslash-t, as BWA
                 // does) or an already-tab-separated string.
@@ -470,6 +477,7 @@ int main(int argc, char* argv[]) {
                       << " mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]\n"
                       << "            [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]\n"
                       << "            [-T N] [-R RG] [-M] [-S] [-P] [-p] [-Y] [-5]\n"
+                      << "            [-h N[,N]]\n"
                       << "            [-x ont2d|pacbio|intractable]\n"
                       << "            <index> <fastq> [fastq2] [sam_out]\n";
             return 1;

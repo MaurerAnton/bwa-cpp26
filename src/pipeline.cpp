@@ -281,6 +281,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             result.primary.flag |= AlnRecord::F_REVERSE;
             std::reverse(result.primary.cigar.begin(), result.primary.cigar.end());
         }
+        result.primary.tags.emplace_back("AS:i", std::to_string(best_chain.score));
         // Aligned spans exclude soft clips (BWA qb/qe convention)
         int32_t fb_qspan = 0, fb_rspan = 0;
         for (uint32_t c : result.primary.cigar) {
@@ -399,6 +400,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
     }
     result.primary.tags.emplace_back("NM:i", std::to_string(nm));
+    result.primary.tags.emplace_back("AS:i", std::to_string(result.best_score));
 
     // MD tag (positions are global concatenated coordinates here;
     // the leading number is the match run length, per SAM spec)
@@ -599,6 +601,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
                              op == bwa::align::CigarOp::Del) nm += len;
                 }
                 promoted.tags.emplace_back("NM:i", std::to_string(nm));
+                promoted.tags.emplace_back("AS:i", std::to_string(sec_swaln.score));
                 result.primary = std::move(promoted);
                 result.supplementary.push_back(std::move(demoted));
             }
@@ -625,6 +628,7 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
             else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) sec_nm += len;
         }
         sec.tags.emplace_back("NM:i", std::to_string(sec_nm));
+        sec.tags.emplace_back("AS:i", std::to_string(sec_swaln.score));
         result.secondary.push_back(std::move(sec));
     }
 
@@ -740,6 +744,7 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
         else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
     }
     rec.tags.emplace_back("NM:i", std::to_string(nm));
+    rec.tags.emplace_back("AS:i", std::to_string(best.score));
     result.mapped = true;
     result.best_score = best.score;
     result.primary = std::move(rec);
@@ -994,26 +999,65 @@ void Aligner::detect_supplementary(const io::SeqRecord& read,
         }
     }
     result.secondary = std::move(kept_secondary);
-    if (result.supplementary.empty()) return;
 
-    // Build SA:Z tags once: primary lists all supplementaries, each
-    // supplementary lists primary + other supplementaries. Format per entry:
-    // RNAME,POS,STRAND,CIGAR,MAPQ,NM;
-    for (const auto& t : result.primary.tags) {
-        if (t.first == "SA:Z") return;  // already tagged
-    }
-    auto entry = [this](const AlnRecord& a) { return make_sa_tag(a); };
-    std::string primary_sa;
-    for (const auto& supp : result.supplementary) primary_sa += entry(supp);
-    if (!primary_sa.empty()) {
-        result.primary.tags.emplace_back("SA:Z", primary_sa);
-        for (size_t i = 0; i < result.supplementary.size(); ++i) {
-            std::string sa = entry(result.primary);
-            for (size_t j = 0; j < result.supplementary.size(); ++j) {
-                if (j == i) continue;
-                sa += entry(result.supplementary[j]);
+    // Build SA:Z tags once (only when supplementaries exist): primary lists
+    // all supplementaries, each supplementary lists primary + others.
+    // Format per entry: RNAME,POS,STRAND,CIGAR,MAPQ,NM;
+    if (!result.supplementary.empty()) {
+        bool has_sa = false;
+        for (const auto& t : result.primary.tags) {
+            if (t.first == "SA:Z") {
+                has_sa = true;
+                break;
             }
-            result.supplementary[i].tags.emplace_back("SA:Z", sa);
+        }
+        if (!has_sa) {
+            auto entry = [this](const AlnRecord& a) { return make_sa_tag(a); };
+            std::string primary_sa;
+            for (const auto& supp : result.supplementary) primary_sa += entry(supp);
+            if (!primary_sa.empty()) {
+                result.primary.tags.emplace_back("SA:Z", primary_sa);
+                for (size_t i = 0; i < result.supplementary.size(); ++i) {
+                    std::string sa = entry(result.primary);
+                    for (size_t j = 0; j < result.supplementary.size(); ++j) {
+                        if (j == i) continue;
+                        sa += entry(result.supplementary[j]);
+                    }
+                    result.supplementary[i].tags.emplace_back("SA:Z", sa);
+                }
+            }
+        }
+    }
+
+    // Build XA:Z tag (BWA -h): alternative (secondary, non-supplementary)
+    // hits scoring >80% of the primary. Emitted only when 1..xa_max_hits-1
+    // such hits exist (highly repetitive reads omit XA). Format per entry:
+    // RNAME,STRAND+POS,CIGAR,NM;  e.g. chr1,+100,50M,0;
+    if (config_.output_xa && !result.secondary.empty() && result.best_score > 0) {
+        std::string xa;
+        int32_t threshold = (result.best_score * 4 + 2) / 5;  // ceil(0.8*best)
+        int32_t count = 0;
+        for (const auto& sec : result.secondary) {
+            if (sec.score <= threshold) continue;
+            if (count >= config_.xa_max_hits) break;
+            xa += sec.rname;
+            xa += ',';
+            xa += (sec.flag & AlnRecord::F_REVERSE) ? '-' : '+';
+            xa += std::to_string(sec.pos);
+            xa += ',';
+            xa += format_cigar(sec.cigar);
+            xa += ',';
+            for (const auto& tag : sec.tags) {
+                if (tag.first == "NM:i" || tag.first == "NM") {
+                    xa += tag.second;
+                    break;
+                }
+            }
+            xa += ';';
+            ++count;
+        }
+        if (count > 0 && count < config_.xa_max_hits) {
+            result.primary.tags.emplace_back("XA:Z", xa);
         }
     }
 }
@@ -1048,6 +1092,7 @@ AlnRecord Aligner::create_supplementary(const io::SeqRecord& read,
         else if (op == bwa::align::CigarOp::Ins || op == bwa::align::CigarOp::Del) nm += len;
     }
     supp.tags.emplace_back("NM:i", std::to_string(nm));
+    supp.tags.emplace_back("AS:i", std::to_string(score));
 
     return supp;
 }

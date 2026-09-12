@@ -68,6 +68,11 @@ struct Config {
     // the -a flag enables them.
     bool output_secondary = false;
     bool output_supplementary = true;
+    // XA tag for alternative hits (BWA -h, on by default): if 1..xa_max_hits
+    // secondaries score >80% of the primary, list them as
+    // rname,strand+pos,CIGAR,NM; entries.
+    bool output_xa = true;
+    int xa_max_hits = 5;
     int min_mapq = 1;             // Minimum MAPQ
     // Mark split (supplementary) hits as secondary instead (-M), for
     // pipelines that require Picard-compatible flags.
