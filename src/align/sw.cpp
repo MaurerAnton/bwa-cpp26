@@ -116,7 +116,9 @@ Alignment sw_semi_global_extend(const Scoring& sc,
             int32_t f_ext = dp[idx(i - 1, j)].f + sc.gap_ext;
             int32_t f = std::max(f_up, f_ext);
 
-            int32_t h = std::max({h_diag, e, f});
+            int32_t h = h_diag;
+            if (e > h) h = e;
+            if (f > h) h = f;
 
             dp[cur_idx].h = h;
             dp[cur_idx].e = e;
@@ -686,7 +688,9 @@ Alignment sw_global(const Scoring& sc,
                                   dp[idx(i, j - 1)].e + sc.gap_ext);
             int32_t f = std::max(dp[idx_up].h + sc.gap_open + sc.gap_ext,
                                   dp[idx(i - 1, j)].f + sc.gap_ext);
-            int32_t h = std::max({h_diag, e, f});
+            int32_t h = h_diag;
+            if (e > h) h = e;
+            if (f > h) h = f;
 
             dp[idx(i, j)].h = h;
             dp[idx(i, j)].e = e;
