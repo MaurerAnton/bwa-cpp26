@@ -280,15 +280,31 @@ int main(int argc, char* argv[]) {
     }
 
     if (cmd == "index") {
-        if (argc < 4) {
-            std::cerr << "Usage: " << argv[0] << " index <fasta> <prefix>\n";
+        // BWA-compatible: `index [-p prefix] <fasta> [prefix]`.
+        const char* prefix = nullptr;
+        const char* fasta = nullptr;
+        for (int i = 2; i < argc; ++i) {
+            std::string_view a = argv[i];
+            if ((a == "-p" || a == "--prefix") && i + 1 < argc) {
+                prefix = argv[++i];
+            } else if (fasta == nullptr) {
+                fasta = argv[i];
+            } else if (prefix == nullptr) {
+                prefix = argv[i];
+            } else {
+                std::cerr << "Usage: " << argv[0] << " index [-p prefix] <fasta> [prefix]\n";
+                return 1;
+            }
+        }
+        if (fasta == nullptr || prefix == nullptr) {
+            std::cerr << "Usage: " << argv[0] << " index [-p prefix] <fasta> [prefix]\n";
             return 1;
         }
-        std::cerr << "Building index from " << argv[2] << " to " << argv[3] << "...\n";
+        std::cerr << "Building index from " << fasta << " to " << prefix << "...\n";
         auto start = std::chrono::high_resolution_clock::now();
         Config cfg = Config::default_mem();
-        Index idx = Index::build(argv[2], cfg);
-        idx.save(argv[3]);
+        Index idx = Index::build(fasta, cfg);
+        idx.save(prefix);
         auto end = std::chrono::high_resolution_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         std::cerr << "Index built in " << ms << " ms\n";

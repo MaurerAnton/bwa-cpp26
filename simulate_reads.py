@@ -255,10 +255,11 @@ def main():
     print("Building index with bwa-cpp26...")
     subprocess.run([args.bwa_cpp, 'index', ref_fa, idx_prefix], check=True)
     
-    # Also build with system bwa if available
+    # Also build with system bwa if available (BWA uses -p for the prefix)
     has_sys_bwa = False
     try:
-        subprocess.run([args.bwa_sys, 'index', ref_fa, idx_prefix + '_sys'], check=True, capture_output=True)
+        subprocess.run([args.bwa_sys, 'index', '-p', idx_prefix + '_sys', ref_fa],
+                       check=True, capture_output=True)
         has_sys_bwa = True
     except:
         print("System bwa not available, skipping comparison")
