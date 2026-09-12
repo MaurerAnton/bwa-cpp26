@@ -194,7 +194,14 @@ void Aligner::align_impl(const bwa::io::SeqRecord& read, AlignmentResult& result
         // banded extension clips everything before the chain (long reads /
         // partial chains lost most of their aligned length this way).
         int32_t local_begin = chain.mems.front().ref_pos - chain.query_begin;
-        int32_t padding = effective_config.band_width * 2;
+        // Half-band padding. The DP band must cover the start offset (the
+        // window begins `padding` bases before where query[0] maps), and its
+        // width is max(band_width, |qlen-rlen|+1). Padding == band_width/2
+        // keeps |qlen-rlen| <= band_width so the band stays at its narrow
+        // minimum; larger padding widened the band proportionally and made
+        // extension several times more expensive for no accuracy gain
+        // (verified against BWA placements).
+        int32_t padding = std::max<int32_t>(8, effective_config.band_width / 2);
         ref_begin_out = global_base + std::max<int32_t>(0, local_begin - padding);
         ref_end_out = global_base + std::min<int32_t>(ref_len, local_begin + query_len + padding);
         return ref_end_out > ref_begin_out;
