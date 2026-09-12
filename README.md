@@ -189,16 +189,17 @@ Out of scope (not part of BWA-MEM; listed here to avoid confusion):
   Sanitizers are enabled by default for unoptimized builds and cost
   ~10-15x at runtime.
 - Reference points (E. coli K-12, 4.6 MB, 4-core machine): index build
-  ~12-19 s; 2000 simulated 150-mers with 1% error align in ~2.1 s CPU
-  (~1.1 ms/read; ~3.5 s wall including index load) single-threaded;
+  ~12-19 s; 2000 simulated 150-mers with 1% error align in ~2.0 s CPU
+  (~1.0 ms/read; ~2.7 s wall including index load) single-threaded;
   0 unmapped, 1984/2000 within 5 bp of truth, 1982/2000 placements
-  identical to BWA 0.7.19. For reference, BWA 0.7.19 on the same reads:
+  identical to BWA 0.7.19 (MAPQ mean absolute difference 0.28 on
+  concordant placements). For reference, BWA 0.7.19 on the same reads:
   ~0.9 s CPU.
-- Speed work: the banded extension window and secondary-chain handling
-  were the hot spots. Tightening the SW window padding (keeps the DP band
-  at its minimum width) plus skipping extension for chains whose hits
-  cannot be emitted took the 2000-read CPU time from 10.0 s to 2.1 s
-  (4.7x) with byte-identical placements.
+- Speed work: the banded extension window, secondary-chain handling and
+  repeat fan-out were the hot spots. Tightening the SW window padding
+  (keeps the DP band at its minimum width), skipping extension for chains
+  whose hits cannot be emitted, and capping repeat fan-out took the
+  2000-read CPU time from 10.0 s to 2.0 s (5x) with unchanged placements.
 - 1000 simulated 350 bp-insert pairs: 98.9% flagged proper pair with
   TLEN = +/-350 (insert size is estimated from the first 512 pairs).
 - Long reads: a 5 kb read with 5% substitutions + 0.5% indels aligns
