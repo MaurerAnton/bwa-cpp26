@@ -229,7 +229,7 @@ public:
     // positions; we cap lower because only the count (for MAPQ ambiguity)
     // and a few representatives (for chaining) matter, while the DP cost
     // grows with the square of the MEM count.
-    static constexpr int32_t kMaxOccPerSeed = 32;
+    static constexpr int32_t kMaxOccPerSeed = 4;
     // Hard cap on MEMs per find() call to bound chaining cost on
     // pathological repeat reads.
     static constexpr size_t kMaxMemsTotal = 4096;
@@ -349,16 +349,20 @@ public:
                     contained = true;
                     break;
                 }
-                // Suppress on query overlap only when the two MEMs also
-                // overlap in reference (same locus). Same-query-span MEMs at
-                // distinct loci are repeat copies: keeping them is what lets
-                // chaining report competing placements and MAPQ reflect the
-                // ambiguity (BWA sub_n equivalent). Previously the reference
-                // check was missing, so repeats collapsed to one arbitrary
-                // copy reported with MAPQ 60.
+                // Suppress query-overlapping MEMs only when they describe the
+                // same placement: same diagonal (ref_pos - query_pos). MEMs
+                // with the same query span but different diagonals are repeat
+                // copies (including tandem repeats whose reference spans
+                // overlap, e.g. a 20-mer in a 4 bp-period repeat). Keeping
+                // them lets chaining report competing placements so MAPQ
+                // reflects the ambiguity (BWA sub_n equivalent). A previous
+                // reference-overlap test collapsed tandem copies to one hit
+                // reported with MAPQ 60.
+                int32_t diag_mem = mem.ref_pos - mem.query_pos;
+                int32_t diag_kept = kept.ref_pos - kept.query_pos;
                 if (mem.query_pos < kept.query_end() && mem.query_end() > kept.query_pos &&
-                    mem.ref_pos < kept.ref_end() && mem.ref_end() > kept.ref_pos) {
-                    // Overlap - keep higher score
+                    diag_mem == diag_kept) {
+                    // Same placement - keep higher score
                     if (mem.score <= kept.score) {
                         contained = true;
                         break;
