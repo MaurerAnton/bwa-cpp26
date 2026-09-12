@@ -203,7 +203,7 @@ Out of scope (not part of BWA-MEM; listed here to avoid confusion):
 bwa mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]
         [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]
         [-T N] [-R RG] [-M] [-S] [-P] [-p] [-Y] [-5]
-        [-x ont2d|pacbio|intractable]
+        [-x ont2d|pacbio|intractable] [-h N[,N]]
         <index> <fastq> [fastq2] [sam_out]
 ```
 
@@ -227,6 +227,10 @@ bwa mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]
 | `-Y` | soft-clip (not hard-clip) split hits | off |
 | `-5` | smallest-coordinate split hit is primary | off |
 | `-x PRESET` | read-type preset (`ont2d`, `pacbio`, `intractable`) | short-read defaults |
+| `-h N[,N]` | list alternative hits in `XA:Z` (1–N hits above 80%) | 5 (on) |
+
+Primary alignments carry `AS:i:` (score), `NM:i:`, `MD:Z:`, `XS:i:`
+(suboptimal) and, for split reads, reciprocal `SA:Z:` tags.
 
 ## Contributing
 
