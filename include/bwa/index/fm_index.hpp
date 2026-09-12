@@ -374,8 +374,8 @@ inline bool is_valid_sa(const core::Vector<uint32_t>& sa, size_t nrows) {
 class FMIndex {
 public:
     using occ_t = uint32_t;
-    static constexpr int OCC_INTERVAL = 128; // Rank sampling interval
-    static constexpr int SA_INTERVAL = 32;   // SA sampling interval
+    static constexpr int OCC_INTERVAL = 64;  // Rank sampling interval
+    static constexpr int SA_INTERVAL = 16;   // SA sampling interval
     static constexpr int ALPHABET = 6;       // $, A, C, G, T, N
     static constexpr uint8_t CODE_SENTINEL = 0;
 

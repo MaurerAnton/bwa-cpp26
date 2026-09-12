@@ -1777,10 +1777,11 @@ void Index::build_impl(const char* fasta_path, const Config& cfg) {
         read_result = reader.read(rec);
     }
 
-    // Build metadata string (v3: 1-byte BWT codes with sentinel row,
+    // Build metadata string (v4: denser SA/OCC sampling; v3 readers would
+    // mis-slice the .sa/.occ files, so the version is bumped to force a rebuild)
     // 6-symbol occ tables, N-mask in .pac)
     std::ostringstream oss;
-    oss << "BWA-CPP26-METADATA-v3\n";
+    oss << "BWA-CPP26-METADATA-v4\n";
     oss << refs_.size() << "\n";
     oss << total_len << "\n";
     for (const auto& ref : refs_) {
@@ -1865,9 +1866,9 @@ void Index::load_impl(const char* prefix) {
     // 6-symbol occ tables, N-mask in .pac; older files misload silently,
     // so refuse them explicitly)
     std::string_view mv = meta_;
-    if (!mv.starts_with("BWA-CPP26-METADATA-v3\n")) {
+    if (!mv.starts_with("BWA-CPP26-METADATA-v4\n")) {
         throw std::runtime_error(
-            "Unsupported index version (need v3, found incompatible metadata). "
+            "Unsupported index version (need v4, found incompatible metadata). "
             "Rebuild the index with this bwa-cpp26 version.");
     }
     size_t pos = mv.find('\n') + 1;
@@ -1949,7 +1950,8 @@ void Index::load_impl(const char* prefix) {
         size_t off = 0;
         for (size_t ri = 0; ri < num_refs; ++ri) {
             // SA has length+1 rows (sentinel included)
-            size_t want = (refs_[ri].length + 1 + 31) / 32;
+            size_t want = (refs_[ri].length + 1 + bwa::index::FMIndex::SA_INTERVAL - 1) /
+                          bwa::index::FMIndex::SA_INTERVAL;
             size_t have = (off < sa_avail) ? std::min(want, sa_avail - off) : 0;
             fm_index_[ri].set_sa_samples(
                 std::vector<uint32_t>(sa_data + off, sa_data + off + have));
@@ -1970,7 +1972,8 @@ void Index::load_impl(const char* prefix) {
         for (size_t ri = 0; ri < num_refs; ++ri) {
             // Rows = length+1 (sentinel row included)
             size_t nrows = refs_[ri].length + 1;
-            size_t num_intv = (nrows + 128 - 1) / 128 + 1;
+            size_t num_intv = (nrows + bwa::index::FMIndex::OCC_INTERVAL - 1) /
+                               bwa::index::FMIndex::OCC_INTERVAL + 1;
             size_t want = num_intv * bwa::index::FMIndex::ALPHABET;
             size_t have = (off < occ_avail) ? std::min(want, occ_avail - off) : 0;
             std::vector<uint32_t> occ(occ_data + off, occ_data + off + have);
@@ -1980,7 +1983,8 @@ void Index::load_impl(const char* prefix) {
 
             // Rebuild count table from this ref's final interval
             std::vector<uint32_t> cnt(bwa::index::FMIndex::ALPHABET + 1, 0);
-            size_t last_intv = (nrows + 128 - 1) / 128;
+            size_t last_intv = (nrows + bwa::index::FMIndex::OCC_INTERVAL - 1) /
+                                bwa::index::FMIndex::OCC_INTERVAL;
             for (int b = 0; b < bwa::index::FMIndex::ALPHABET; ++b) {
                 cnt[static_cast<size_t>(b) + 1] =
                     cnt[static_cast<size_t>(b)] +
