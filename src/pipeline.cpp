@@ -678,11 +678,15 @@ bool Aligner::rescue_end(const io::SeqRecord& read, const AlnRecord& mate,
     int32_t mate_global = static_cast<int32_t>(mref->offset) + (mate.pos - 1);
 
     // Search window around the mate: estimated insert distribution when
-    // available (mean + 4*std), else a fixed 2kb window.
+    // available (mean + 4*std, capped by an explicit -I max), else fixed 2kb.
     int32_t rescue_window = 2000;
     if (insert_stats_.valid) {
         rescue_window = static_cast<int32_t>(insert_stats_.mean +
                                              4.0 * insert_stats_.std);
+        if (insert_stats_.max_window > 0 &&
+            rescue_window > static_cast<int32_t>(insert_stats_.max_window)) {
+            rescue_window = static_cast<int32_t>(insert_stats_.max_window);
+        }
         if (rescue_window < 200) rescue_window = 200;
     }
     int32_t w_begin = std::max<int32_t>(static_cast<int32_t>(mref->offset),
@@ -841,6 +845,10 @@ void Aligner::align_pair_impl(const bwa::io::SeqRecord& read1,
         if (insert_stats_.valid) {
             max_insert = static_cast<int32_t>(insert_stats_.mean +
                                               4.0 * insert_stats_.std);
+            if (insert_stats_.max_window > 0 &&
+                max_insert > static_cast<int32_t>(insert_stats_.max_window)) {
+                max_insert = static_cast<int32_t>(insert_stats_.max_window);
+            }
             if (max_insert < 1) max_insert = 1;
         }
         if (fr && insert <= max_insert) {
@@ -1316,6 +1324,9 @@ void write_bam_records(const Index& index, const Config& config,
                << "\tPN:" << config.program_name
                << "\tVN:" << config.program_version
                << "\tCL:" << config.program_command << "\n";
+    for (const auto& line : config.extra_header_lines) {
+        sam_header << line << "\n";
+    }
 
     writer.write_header(sam_header.str(),
                         static_cast<int32_t>(index.num_references()));
@@ -1354,6 +1365,12 @@ void write_bam_records(const Index& index, const Config& config,
 // moments. No-op for stdin input or when stats are already available.
 void Pipeline::ensure_insert_size(const char* fastq1, const char* fastq2) const {
     if (insert_stats_.valid) return;
+    // Manual override (BWA -I) bypasses estimation.
+    if (config_.manual_insert.valid) {
+        insert_stats_ = config_.manual_insert;
+        aligner_.set_insert_stats(insert_stats_);
+        return;
+    }
     const bool interleaved = (fastq2 == nullptr);
     if (std::string_view(fastq1) == "-") return;
     if (!interleaved && std::string_view(fastq2) == "-") return;
@@ -1497,6 +1514,9 @@ void Pipeline::write_header(std::ostream& out) const {
         << "\tPN:" << config_.program_name
         << "\tVN:" << config_.program_version
         << "\tCL:" << config_.program_command << "\n";
+    for (const auto& line : config_.extra_header_lines) {
+        out << line << "\n";
+    }
 }
 
 void Pipeline::write_alignment(std::ostream& out, const AlignmentResult& result) const {

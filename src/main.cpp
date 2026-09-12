@@ -407,6 +407,64 @@ int main(int argc, char* argv[]) {
                     cfg.output_xa = true;
                     cfg.xa_max_hits = h1;
                 }
+            } else if (a == "-I") {
+                // Insert-size distribution: mean[,std[,max[,min]]].
+                // BWA defaults std to 10% of the mean when absent.
+                std::string spec(value("-I"));
+                std::vector<std::string> parts;
+                size_t start = 0;
+                while (start <= spec.size()) {
+                    size_t comma = spec.find(',', start);
+                    parts.push_back(spec.substr(
+                        start, comma == std::string::npos
+                                   ? std::string::npos
+                                   : comma - start));
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                auto to_double = [](const std::string& s, double& out) {
+                    if (s.empty()) return false;
+                    char* end = nullptr;
+                    double v = std::strtod(s.c_str(), &end);
+                    if (end == s.c_str() || *end != '\0' || v <= 0) return false;
+                    out = v;
+                    return true;
+                };
+                double mean = 0, std = 0, mx = 0, mn = 0;
+                if (!parts.empty() && to_double(parts[0], mean)) {
+                    std = 0.1 * mean;
+                    if (parts.size() > 1 && !parts[1].empty() &&
+                        !to_double(parts[1], std)) {
+                        std::cerr << "Error: bad -I stddev '" << parts[1] << "'\n";
+                        return 1;
+                    }
+                    if (parts.size() > 2 && !parts[2].empty() &&
+                        !to_double(parts[2], mx)) {
+                        std::cerr << "Error: bad -I max '" << parts[2] << "'\n";
+                        return 1;
+                    }
+                    if (parts.size() > 3 && !parts[3].empty() &&
+                        !to_double(parts[3], mn)) {
+                        std::cerr << "Error: bad -I min '" << parts[3] << "'\n";
+                        return 1;
+                    }
+                    (void)mn;  // accepted for compatibility; not yet modeled
+                    cfg.manual_insert.mean = mean;
+                    cfg.manual_insert.std = std;
+                    cfg.manual_insert.max_window = mx;
+                    cfg.manual_insert.valid = true;
+                } else {
+                    std::cerr << "Error: bad -I spec (want mean[,std[,max[,min]]])\n";
+                    return 1;
+                }
+            } else if (a == "-H") {
+                // Extra SAM header line(s); must start with '@' like BWA.
+                std::string line(value("-H"));
+                if (line.empty() || line[0] != '@') {
+                    std::cerr << "Error: -H header line must start with '@'\n";
+                    return 1;
+                }
+                cfg.extra_header_lines.push_back(line);
             } else if (a == "-R") {
                 // Accept '@RG\tID:..\tSM:..' (literal backslash-t, as BWA
                 // does) or an already-tab-separated string.
@@ -477,7 +535,7 @@ int main(int argc, char* argv[]) {
                       << " mem [-a] [-t N] [-o out.sam|out.bam] [-k N] [-c N] [-w N]\n"
                       << "            [-A N] [-B N] [-O N[,N]] [-E N[,N]] [-L N[,N]]\n"
                       << "            [-T N] [-R RG] [-M] [-S] [-P] [-p] [-Y] [-5]\n"
-                      << "            [-h N[,N]]\n"
+                      << "            [-h N[,N]] [-I mean[,std[,max[,min]]]] [-H HDR]\n"
                       << "            [-x ont2d|pacbio|intractable]\n"
                       << "            <index> <fastq> [fastq2] [sam_out]\n";
             return 1;

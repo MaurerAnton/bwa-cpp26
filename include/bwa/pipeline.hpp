@@ -42,6 +42,8 @@ struct ReadGroup {
 struct InsertSizeStats {
     double mean = 0.0;
     double std = 0.0;
+    // Hard cap on the pairing window (BWA -I max). Zero = auto (mean+4*std).
+    double max_window = 0.0;
     bool valid = false;
 };
 
@@ -52,7 +54,6 @@ struct Config {
     int max_occ = 500;            // Max occurrences for a seed
     int max_gap = 10000;          // Max gap in chaining
     int min_chain_score = 10;     // Minimum chain score
-    int max_chain_gap = 10000;    // Max gap between chains
     int band_width = 32;          // Band width for SW extension
     int max_score_drop = 100;     // Max score drop for early termination
 
@@ -73,7 +74,6 @@ struct Config {
     // rname,strand+pos,CIGAR,NM; entries.
     bool output_xa = true;
     int xa_max_hits = 5;
-    int min_mapq = 1;             // Minimum MAPQ
     // Mark split (supplementary) hits as secondary instead (-M), for
     // pipelines that require Picard-compatible flags.
     bool mark_split_secondary = false;
@@ -83,6 +83,13 @@ struct Config {
     // Pairing controls (BWA -S / -P)
     bool skip_mate_rescue = false;
     bool skip_pairing = false;
+    // Manual insert-size distribution (BWA -I mean[,std[,max[,min]]]).
+    // When valid, bypasses automatic estimation. Only mean/std/max are
+    // used (min is accepted for CLI compatibility); max caps the pairing
+    // window, 0 = auto (mean + 4*std).
+    InsertSizeStats manual_insert;
+    // Extra SAM header lines (BWA -H, may be given multiple times).
+    std::vector<std::string> extra_header_lines;
     // -p: consecutive records in one FASTQ are mates (interleaved input).
     bool smart_pairing = false;
     // -Y: soft-clip (not hard-clip) split/supplementary segments.
